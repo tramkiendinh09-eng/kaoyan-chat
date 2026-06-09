@@ -1,0 +1,16 @@
+[Unit]
+Description=Kaoyan Chat web app
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kaoyan-chat
+EnvironmentFile=/opt/kaoyan-chat/.env
+ExecStart=/usr/bin/node /opt/kaoyan-chat/server.js
+Restart=always
+RestartSec=3
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

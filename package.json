@@ -1,0 +1,21 @@
+{
+  "name": "kaoyan-chat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted kaoyan AI Q&A chat with memory and multi-provider routing.",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check public/app.js && node --check server.js",
+    "verify:ui": "node scripts/verify-ui.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "marked": "^18.0.5",
+    "mathjax": "^4.1.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}

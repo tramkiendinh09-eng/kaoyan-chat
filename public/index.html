@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>考研答疑</title>
+    <script>
+      (() => {
+        try {
+          const theme = localStorage.getItem('kc_theme');
+          if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme;
+        } catch {}
+      })();
+    </script>
+    <link rel="stylesheet" href="/chat/styles.css?v=20260608-local-retry-1" />
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [['\\(', '\\)'], ['$', '$']],
+          displayMath: [['\\[', '\\]'], ['$$', '$$']],
+          processEscapes: true,
+          processEnvironments: true
+        },
+        svg: { fontCache: 'global' },
+        startup: {
+          typeset: false,
+          ready: () => {
+            MathJax.startup.defaultReady();
+            window.dispatchEvent(new Event('kc:mathjax-ready'));
+          }
+        },
+        options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
+      };
+    </script>
+    <script defer src="/chat/vendor/marked/marked.umd.js"></script>
+    <script defer src="/chat/vendor/mathjax/tex-svg.js"></script>
+    <script defer src="/chat/app.js?v=20260608-local-retry-1"></script>
+  </head>
+  <body>
+    <div id="app" class="app-shell"></div>
+  </body>
+</html>
