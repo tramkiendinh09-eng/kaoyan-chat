@@ -3,6 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfcff" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#101318" />
+    <link rel="icon" type="image/svg+xml" href="/chat/favicon.svg?v=20260612-network-retry-1" />
+    <link rel="apple-touch-icon" href="/chat/favicon.svg?v=20260612-network-retry-1" />
+    <link rel="mask-icon" href="/chat/favicon.svg?v=20260612-network-retry-1" color="#8b5cf6" />
     <title>考研答疑</title>
     <script>
       (() => {
@@ -12,7 +17,7 @@
         } catch {}
       })();
     </script>
-    <link rel="stylesheet" href="/chat/styles.css?v=20260608-local-retry-1" />
+    <link rel="stylesheet" href="/chat/styles.css?v=20260616-fix8" />
     <script>
       window.MathJax = {
         tex: {
@@ -33,10 +38,10 @@
       };
     </script>
     <script defer src="/chat/vendor/marked/marked.umd.js"></script>
-    <script defer src="/chat/vendor/mathjax/tex-svg.js"></script>
-    <script defer src="/chat/app.js?v=20260608-local-retry-1"></script>
+    <script async src="/chat/vendor/mathjax/tex-svg.js"></script>
+    <script defer src="/chat/app.js?v=20260616-fix8"></script>
   </head>
   <body>
-    <div id="app" class="app-shell"></div>
+    <div id="app" class="app-shell"><div class="app-loading">正在载入答疑...</div></div>
   </body>
 </html>

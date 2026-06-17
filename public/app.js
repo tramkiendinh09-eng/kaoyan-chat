@@ -3,10 +3,13 @@ const API = `${BASE}/api`;
 const DRAFT_PREFIX = 'kc_draft_';
 const COMPOSER_HISTORY_PREFIX = 'kc_composer_history_';
 const COMPOSER_HISTORY_LIMIT = 30;
+const CHAT_MODE_KEY = 'kc_chat_mode';
+const AGENT_TUTORIAL_KEY = 'kc_agent_tutorial_seen';
 const CUSTOM_PROMPTS_PREFIX = 'kc_custom_prompts_';
 const CUSTOM_PROMPT_LIMIT = 24;
 const CUSTOM_PROMPT_TEXT_LIMIT = 1600;
 const DELETE_UNDO_MS = 5000;
+const ZHENTI_PURCHASE_URL = 'https://catfk.com/item/uy7384';
 const QUICK_PROMPTS = [
   { id: 'steps', label: '分步骤', text: '请按「思路 → 关键公式 → 计算步骤 → 易错点」分步骤讲解。' },
   { id: 'key', label: '只讲关键', text: '请只讲本题最关键的一步，以及为什么这样想。' },
@@ -23,11 +26,16 @@ const FOLLOW_UP_PROMPTS = [
 
 const state = {
   student: null,
+  invite: null,
+  quota: null,
+  zhentiAccess: null,
   conversations: [],
   conversationQuery: '',
   messageSearch: { query: '', loading: false, results: [], error: '' },
   savedMessages: { open: false, loading: false, results: [], error: '' },
-  studyMemory: { open: false, loading: false, error: '' },
+  studyMemory: { open: false, loading: false, error: '', topicMastery: null },
+  review: { open: false, loading: false, error: '', summary: null, cards: [], index: 0, revealed: false },
+  mockExam: { open: false, loading: false, submitting: false, error: '', exam: null, answers: '', now: Date.now() },
   promptLibraryOpen: false,
   commandPalette: { open: false, query: '', index: 0 },
   customPrompts: [],
@@ -38,12 +46,24 @@ const state = {
   conversationFindQuery: '',
   conversationFindIndex: -1,
   sidebarCollapsed: loadStoredSidebarCollapsed(),
+  mobileSidebarOpen: false,
+  rightRailOpen: loadStoredRightRailOpen(),
   theme: loadStoredTheme(),
   currentConversationId: null,
   currentConversationTitle: '答疑会话',
   currentMessages: [],
   providers: [],
   currentProviderId: null,
+  chatMode: loadStoredChatMode(),
+  agentTutorialOpen: false,
+  adminFreeDailyQuestionLimit: 10,
+  redemptionCodes: [],
+  inviteRewards: null,
+  membershipPlans: {},
+  agentProfileKeys: [],
+  agentProfiles: {},
+  agentProfileDefaults: {},
+  agentRouteLogs: [],
   sending: false,
   autoScroll: true,
   abortController: null,
@@ -76,17 +96,33 @@ document.addEventListener('DOMContentLoaded', () => {
 async function initChat() {
   renderAppLoading();
   try {
-    const me = await api('/me');
-    state.student = me.student;
-    state.composerHistory = { items: loadComposerHistory(), index: -1, draft: '' };
+      const me = await api('/me');
+      state.student = me.student;
+      state.invite = me.invite || null;
+      state.quota = me.quota || null;
+      state.zhentiAccess = me.zhentiAccess || me.student?.zhentiAccess || null;
+      state.tongjiAccess = me.tongjiAccess || null;
+      state.redemptions = me.redemptions || [];
+      state.composerHistory = { items: loadComposerHistory(), index: -1, draft: '' };
     state.customPrompts = loadCustomPrompts();
+    if (state.student?.mustBindEmail) {
+      renderStudentEmailBind();
+      return;
+    }
     if (state.student?.needsPasswordSetup) {
       renderStudentPasswordSetup();
       return;
     }
-    await Promise.all([loadProviders(), loadConversations()]);
-    renderChatShell();
-    const routeTarget = initialRouteTarget();
+  if (safeNextPath()) {
+    location.href = safeNextPath();
+    return;
+  }
+  await Promise.all([loadProviders(), loadConversations()]);
+  renderChatShell();
+  updateQuotaUi();
+  showZhentiPayHintIfNeeded();
+  loadReviewSummary();
+  const routeTarget = initialRouteTarget();
     const targetConversation = routeTarget.conversationId && state.conversations.some((item) => item.id === routeTarget.conversationId)
       ? routeTarget.conversationId
       : state.conversations[0]?.id;
@@ -102,28 +138,88 @@ function renderAppLoading() {
   el('#app').innerHTML = '<div class="app-loading">正在载入答疑...</div>';
 }
 
+function safeNextPath() {
+  const raw = new URLSearchParams(location.search).get('next') || '';
+  if (!raw.startsWith('/')) return '';
+  if (raw.startsWith('//')) return '';
+  if (raw.startsWith('/chat')) return '';
+  return raw;
+}
+
+function showZhentiPayHintIfNeeded() {
+  const params = new URLSearchParams(location.search);
+  if (params.get('zhenti') !== 'pay') return;
+  setTimeout(() => {
+    setTransientStatus('考研真题试用已结束，可用兑换码开通到 12.22。', true, 5200);
+  }, 250);
+}
+
+function initialInviteCode() {
+  const params = new URLSearchParams(location.search);
+  return String(params.get('invite') || params.get('ref') || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 24);
+}
+
 function renderStudentLogin() {
+  const next = safeNextPath();
+  const zhentiPay = new URLSearchParams(location.search).get('zhenti') === 'pay';
+  const inviteCode = initialInviteCode();
   el('#app').innerHTML = `
     <main class="login-page">
-      <form class="login-card" id="studentLoginForm">
-        <h1>考研答疑</h1>
-        <p>请输入学号和密码。首次登录请设置密码并再次确认。</p>
-        <div class="form-field">
-          <label for="studentNo">学号</label>
-          <input class="input" id="studentNo" autocomplete="username" placeholder="例如 2702142 或 202702001" required />
+      <div class="login-card">
+        <h1>风青云账号</h1>
+        <p>${zhentiPay
+          ? '考研真题试用已结束，可用兑换码开通到 12.22。'
+          : next
+            ? '登录后会自动回到考研真题；新用户和已有用户都有 14 天试用。'
+            : '一个账号通用考研答疑和考研真题。使用 QQ 邮箱或 Gmail 注册，之后用邮箱和密码登录。旧学号账号可先用学号登录后绑定邮箱。'}</p>
+        <div class="auth-tabs" role="tablist">
+          <button class="auth-tab active" id="loginTab" type="button">登录</button>
+          <button class="auth-tab" id="registerTab" type="button">注册</button>
         </div>
-        <div class="form-field">
-          <label for="studentPassword">密码</label>
-          <input class="input" id="studentPassword" type="password" autocomplete="current-password" minlength="6" maxlength="128" required />
-        </div>
-        <div class="form-field">
-          <label for="studentPasswordConfirm">确认密码</label>
-          <input class="input" id="studentPasswordConfirm" type="password" autocomplete="new-password" minlength="6" maxlength="128" placeholder="首次登录填写" />
-        </div>
-        <button class="btn primary" type="submit">进入答疑</button>
+        <form id="studentLoginForm">
+          <div class="form-field">
+            <label for="loginEmail">邮箱或旧学号</label>
+            <input class="input" id="loginEmail" autocomplete="username" placeholder="name@qq.com / name@gmail.com / 270xxxx" required />
+          </div>
+          <div class="form-field">
+            <label for="loginPassword">密码</label>
+            <input class="input" id="loginPassword" type="password" autocomplete="current-password" minlength="6" maxlength="128" required />
+          </div>
+          <button class="btn primary" type="submit">登录</button>
+        </form>
+        <form class="hidden" id="studentRegisterForm">
+          <div class="form-field">
+            <label for="registerEmail">邮箱</label>
+            <input class="input" id="registerEmail" type="email" autocomplete="username" placeholder="name@qq.com 或 name@gmail.com" required />
+          </div>
+          <div class="form-field">
+            <label for="registerPassword">密码</label>
+            <input class="input" id="registerPassword" type="password" autocomplete="new-password" minlength="6" maxlength="128" required />
+          </div>
+          <div class="form-field">
+            <label for="registerPasswordConfirm">确认密码</label>
+            <input class="input" id="registerPasswordConfirm" type="password" autocomplete="new-password" minlength="6" maxlength="128" required />
+          </div>
+          <div class="form-field">
+            <label for="registerCode">邮箱验证码</label>
+            <div class="code-row">
+              <input class="input" id="registerCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位数字" required />
+              <button class="btn" id="sendRegisterCodeBtn" type="button">发送验证码</button>
+            </div>
+          </div>
+          <div class="form-field">
+            <label for="registerInviteCode">邀请码（选填）</label>
+            <input class="input" id="registerInviteCode" autocomplete="off" placeholder="有推荐人再填" value="${escapeAttr(inviteCode)}" />
+            <span class="form-hint">填写后会自动绑定推荐人。</span>
+          </div>
+          <button class="btn primary" type="submit">注册并进入</button>
+        </form>
         <div class="status" id="loginStatus"></div>
-      </form>
+      </div>
     </main>`;
+  el('#loginTab')?.addEventListener('click', () => setAuthMode('login'));
+  el('#registerTab')?.addEventListener('click', () => setAuthMode('register'));
+  el('#sendRegisterCodeBtn')?.addEventListener('click', sendRegisterCode);
   el('#studentLoginForm').addEventListener('submit', async (event) => {
     event.preventDefault();
     const status = el('#loginStatus');
@@ -133,11 +229,40 @@ function renderStudentLogin() {
       await api('/login', {
         method: 'POST',
         body: {
-          studentNo: el('#studentNo').value.trim(),
-          password: el('#studentPassword').value,
-          passwordConfirm: el('#studentPasswordConfirm').value
+          email: el('#loginEmail').value.trim(),
+          password: el('#loginPassword').value
         }
       });
+      if (safeNextPath()) {
+        location.href = safeNextPath();
+        return;
+      }
+      await initChat();
+    } catch (err) {
+      status.textContent = err.message;
+      status.className = 'status error';
+    }
+  });
+  el('#studentRegisterForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const status = el('#loginStatus');
+    status.textContent = '正在注册...';
+    status.className = 'status';
+    try {
+      await api('/register', {
+        method: 'POST',
+        body: {
+          email: el('#registerEmail').value.trim(),
+          password: el('#registerPassword').value,
+          passwordConfirm: el('#registerPasswordConfirm').value,
+          code: el('#registerCode').value.trim(),
+          inviteCode: el('#registerInviteCode').value.trim()
+        }
+      });
+      if (safeNextPath()) {
+        location.href = safeNextPath();
+        return;
+      }
       await initChat();
     } catch (err) {
       status.textContent = err.message;
@@ -146,12 +271,80 @@ function renderStudentLogin() {
   });
 }
 
+function setAuthMode(mode) {
+  const login = mode !== 'register';
+  el('#loginTab')?.classList.toggle('active', login);
+  el('#registerTab')?.classList.toggle('active', !login);
+  el('#studentLoginForm')?.classList.toggle('hidden', !login);
+  el('#studentRegisterForm')?.classList.toggle('hidden', login);
+  const status = el('#loginStatus');
+  if (status) {
+    status.textContent = '';
+    status.className = 'status';
+  }
+}
+
+async function sendRegisterCode() {
+  const button = el('#sendRegisterCodeBtn');
+  const status = el('#loginStatus');
+  button.disabled = true;
+  status.textContent = '正在发送验证码...';
+  status.className = 'status';
+  try {
+    const data = await api('/auth/request-code', {
+      method: 'POST',
+      body: { email: el('#registerEmail').value.trim() }
+    });
+    status.textContent = data.smtpConfigured ? '验证码已发送，请查看邮箱。' : '验证码已生成。SMTP 未配置，请在服务器日志查看。';
+    startCodeButtonCountdown(button, 60);
+  } catch (err) {
+    button.disabled = false;
+    status.textContent = err.message;
+    status.className = 'status error';
+  }
+}
+
+async function sendBindEmailCode() {
+  const button = el('#sendBindEmailCodeBtn');
+  const status = el('#emailBindStatus');
+  button.disabled = true;
+  status.textContent = '正在发送验证码...';
+  status.className = 'status';
+  try {
+    const data = await api('/auth/request-code', {
+      method: 'POST',
+      body: { email: el('#bindEmail').value.trim(), purpose: 'bind' }
+    });
+    status.textContent = data.smtpConfigured ? '验证码已发送，请查看邮箱。' : '验证码已生成。SMTP 未配置，请在服务器日志查看。';
+    startCodeButtonCountdown(button, 60);
+  } catch (err) {
+    button.disabled = false;
+    status.textContent = err.message;
+    status.className = 'status error';
+  }
+}
+
+function startCodeButtonCountdown(button, seconds) {
+  let remaining = seconds;
+  button.textContent = `${remaining}s`;
+  const timer = setInterval(() => {
+    remaining -= 1;
+    if (remaining <= 0) {
+      clearInterval(timer);
+      button.disabled = false;
+      button.textContent = '发送验证码';
+      return;
+    }
+    button.textContent = `${remaining}s`;
+  }, 1000);
+}
+
 function renderStudentPasswordSetup() {
   el('#app').innerHTML = `
     <main class="login-page">
       <form class="login-card" id="studentPasswordForm">
         <h1>设置登录密码</h1>
-        <p>学号 ${escapeHtml(state.student?.studentNo || '')} 需要先设置密码，之后才能进入答疑和读取历史记忆。</p>
+        <p>账号 ${escapeHtml(studentLabel(state.student))} 需要先设置密码，之后才能进入答疑和读取历史记忆。</p>
         <div class="form-field">
           <label for="newStudentPassword">密码</label>
           <input class="input" id="newStudentPassword" type="password" autocomplete="new-password" minlength="6" maxlength="128" required />
@@ -191,10 +384,62 @@ function renderStudentPasswordSetup() {
   });
 }
 
+function renderStudentEmailBind() {
+  el('#app').innerHTML = `
+    <main class="login-page">
+      <form class="login-card" id="studentEmailBindForm">
+        <h1>绑定邮箱</h1>
+        <p>旧学号账号 ${escapeHtml(state.student?.studentNo || '')} 需要绑定 QQ 邮箱或 Gmail 邮箱。绑定后以后用邮箱和密码登录，历史记录和会员额度会继续保留。</p>
+        <div class="form-field">
+          <label for="bindEmail">邮箱</label>
+          <input class="input" id="bindEmail" type="email" autocomplete="username" placeholder="name@qq.com 或 name@gmail.com" required />
+        </div>
+        <div class="form-field">
+          <label for="bindEmailCode">邮箱验证码</label>
+          <div class="code-row">
+            <input class="input" id="bindEmailCode" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位数字" required />
+            <button class="btn" id="sendBindEmailCodeBtn" type="button">发送验证码</button>
+          </div>
+        </div>
+        <button class="btn primary" type="submit">绑定并进入</button>
+        <button class="btn ghost" id="emailBindLogoutBtn" type="button">退出</button>
+        <div class="status" id="emailBindStatus"></div>
+      </form>
+    </main>`;
+  el('#sendBindEmailCodeBtn')?.addEventListener('click', sendBindEmailCode);
+  el('#emailBindLogoutBtn')?.addEventListener('click', async () => {
+    await api('/logout', { method: 'POST', body: {} });
+    state.student = null;
+    renderStudentLogin();
+  });
+  el('#studentEmailBindForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const status = el('#emailBindStatus');
+    status.textContent = '正在绑定...';
+    status.className = 'status';
+    try {
+      const data = await api('/email/bind', {
+        method: 'POST',
+        body: {
+          email: el('#bindEmail').value.trim(),
+          code: el('#bindEmailCode').value.trim()
+        }
+      });
+      state.student = data.student;
+      state.quota = data.quota || state.quota;
+      await initChat();
+    } catch (err) {
+      status.textContent = err.message;
+      status.className = 'status error';
+    }
+  });
+}
+
 function renderChatShell() {
   const student = state.student;
   el('#app').innerHTML = `
-    <div class="layout ${state.sidebarCollapsed ? 'sidebar-collapsed' : ''}">
+    <div class="layout ${!isMobileViewport() && state.sidebarCollapsed ? 'sidebar-collapsed' : ''} ${state.mobileSidebarOpen ? 'drawer-open' : ''} mode-${escapeAttr(state.chatMode)}">
+      <button class="sidebar-backdrop ${state.mobileSidebarOpen ? '' : 'hidden'}" id="sidebarBackdrop" type="button" aria-label="关闭菜单" tabindex="-1"></button>
       <aside class="sidebar">
         <div class="sidebar-header">
           <div class="brand-row">
@@ -203,9 +448,27 @@ function renderChatShell() {
               <button class="sidebar-toggle" id="sidebarToggleBtn" type="button" aria-expanded="${state.sidebarCollapsed ? 'false' : 'true'}" title="${state.sidebarCollapsed ? '展开侧栏' : '收起侧栏'}">${state.sidebarCollapsed ? '展开' : '收起'}</button>
               <button class="btn" id="newConversationBtn" type="button">新建</button>
             </div>
-          </div>
-          <div class="student-meta">${student ? `学号：${escapeHtml(student.studentNo)}` : '未登录'}</div>
-          <select class="model-select sidebar-model-select" id="providerSelect" data-provider-select="true"></select>
+            </div>
+            <div class="student-meta">${student ? `邮箱：${escapeHtml(student.email || student.studentNo)}` : '未登录'}</div>
+            <div class="quota-meter" id="quotaMeter">${renderQuotaText()}</div>
+            <div class="zhenti-card ${state.zhentiAccess?.allowed ? '' : 'expired'}" id="zhentiAccessCard">
+              <a class="zhenti-access" id="zhentiAccessLink" href="/zhenti/">
+                <span>${escapeHtml(renderZhentiAccessTitle())}</span>
+                <small>${escapeHtml(renderZhentiAccessDetail())}</small>
+              </a>
+            </div>
+            <nav class="module-nav" aria-label="切换模块">
+              <a class="module-link" href="/">首页</a>
+              <a class="module-link" href="/zhenti/">真题</a>
+              <a class="module-link" href="/english/">英语</a>
+              <a class="module-link" href="/tongji/">统计</a>
+            </nav>
+            <button class="account-btn" id="accountBtn" type="button">我的账户 · 邀请有奖</button>
+            <form class="redeem-form" id="redeemForm">
+              <input class="input" id="redeemCodeInput" placeholder="兑换码" autocomplete="off" />
+              <button class="btn" type="submit">兑换</button>
+            </form>
+            <div class="model-dropdown sidebar-model-select" data-model-dropdown="sidebar"></div>
           <input class="input sidebar-search" id="conversationSearch" placeholder="搜索会话或消息" value="${escapeAttr(state.conversationQuery)}" />
           <div class="conversation-find">
             <input class="input conversation-find-input" id="conversationFind" placeholder="查找当前会话" value="${escapeAttr(state.conversationFindQuery)}" />
@@ -216,9 +479,17 @@ function renderChatShell() {
               <span class="conversation-find-count" id="conversationFindCount"></span>
             </div>
           </div>
-          <button class="saved-messages-toggle ${state.savedMessages.open ? 'active' : ''}" id="savedMessagesBtn" type="button" aria-pressed="${state.savedMessages.open ? 'true' : 'false'}">${state.savedMessages.open ? '关闭复习收藏' : '复习收藏'}</button>
-          <button class="archive-conversations-toggle ${state.showArchived ? 'active' : ''}" id="archiveConversationsBtn" type="button" aria-pressed="${state.showArchived ? 'true' : 'false'}">${state.showArchived ? '返回当前会话' : '归档会话'}</button>
-          <button class="study-memory-toggle ${state.studyMemory.open ? 'active' : ''}" id="studyMemoryBtn" type="button" aria-pressed="${state.studyMemory.open ? 'true' : 'false'}">${state.studyMemory.open ? '关闭学习记忆' : '学习记忆'}</button>
+          <details class="sidebar-tool-group study-tools" id="studyToolsGroup" ${anyStudyToolActive() ? 'open' : ''}>
+            <summary>学习工具 · 复习 / 记忆 / 模拟考</summary>
+            <div class="study-tools-grid">
+              <button class="saved-messages-toggle ${state.savedMessages.open ? 'active' : ''}" id="savedMessagesBtn" type="button" aria-pressed="${state.savedMessages.open ? 'true' : 'false'}">${state.savedMessages.open ? '关闭复习收藏' : '复习收藏'}</button>
+              <button class="archive-conversations-toggle ${state.showArchived ? 'active' : ''}" id="archiveConversationsBtn" type="button" aria-pressed="${state.showArchived ? 'true' : 'false'}">${state.showArchived ? '返回当前会话' : '归档会话'}</button>
+              <button class="study-memory-toggle ${state.studyMemory.open ? 'active' : ''}" id="studyMemoryBtn" type="button" aria-pressed="${state.studyMemory.open ? 'true' : 'false'}">${state.studyMemory.open ? '关闭学习记忆' : '学习记忆'}</button>
+              <button class="review-toggle" id="reviewBtn" type="button" title="间隔重复复习你加入错题本的题目">今日复习</button>
+              <button class="practice-toggle" id="practiceBtn" type="button" title="根据你近 7 天的问答生成一套同考点模拟题">巩固练习 · 出模拟题</button>
+              <button class="mock-exam-toggle ${state.mockExam.open ? 'active' : ''}" id="mockExamBtn" type="button" aria-pressed="${state.mockExam.open ? 'true' : 'false'}" title="生成限时小卷，交卷后自动批改">模拟考模式</button>
+            </div>
+          </details>
           <div class="message-outline hidden" id="messageOutline"></div>
         </div>
         <div class="conversation-list" id="conversationList"></div>
@@ -260,9 +531,15 @@ function renderChatShell() {
           </details>
         </div>
       </aside>
-      <main class="main ${state.currentMessages.length ? '' : 'chat-empty'}">
+      <main class="main ${state.currentMessages.length ? '' : 'chat-empty'} mode-${escapeAttr(state.chatMode)}">
         <header class="chat-topbar" id="chatTopbar">
-          <div class="chat-topbar-title" id="chatTopbarTitle">${escapeHtml(currentConversationDisplayTitle())}</div>
+          <button class="mobile-menu-btn" id="mobileMenuBtn" type="button" aria-label="打开会话菜单" aria-expanded="false">
+            <span class="mobile-menu-bars" aria-hidden="true"></span>
+          </button>
+          <div class="chat-topbar-title-wrap">
+            <div class="chat-mode-kicker" id="chatModeKicker">${escapeHtml(chatModeKicker())}</div>
+            <div class="chat-topbar-title" id="chatTopbarTitle">${escapeHtml(currentConversationDisplayTitle())}</div>
+          </div>
           <div class="chat-topbar-controls">
             <div class="chat-topbar-actions" aria-label="当前会话操作">
               <button class="topbar-action" id="topbarRenameBtn" type="button">改名</button>
@@ -270,13 +547,14 @@ function renderChatShell() {
               <button class="topbar-action" id="topbarExportMdBtn" type="button">MD</button>
               <button class="topbar-action" id="topbarExportPdfBtn" type="button">PDF</button>
             </div>
-            <select class="model-select topbar-model-select" id="providerSelectTop" data-provider-select="true" aria-label="选择模型"></select>
+            <div class="model-dropdown topbar-model-select" data-model-dropdown="topbar" aria-label="选择模型"></div>
           </div>
         </header>
         <section class="messages" id="messages"></section>
         <button class="scroll-bottom hidden" id="scrollBottomBtn" type="button">到底部</button>
         <section class="composer">
           <div class="composer-inner">
+            ${renderModeSwitchPanel()}
             <div class="attachment-row" id="attachmentRow"></div>
             <div class="quick-prompts" id="quickPrompts">
               ${QUICK_PROMPTS.map((item) => `<button class="quick-prompt" data-quick-prompt="${escapeAttr(item.id)}" type="button">${escapeHtml(item.label)}</button>`).join('')}
@@ -293,9 +571,10 @@ function renderChatShell() {
                 <button class="btn ghost" id="promptLibraryBtn" type="button" aria-expanded="${state.promptLibraryOpen ? 'true' : 'false'}">模板</button>
                 <button class="btn ghost" id="savePromptBtn" type="button">存模板</button>
                 <button class="btn ghost" id="clearAttachmentsBtn" type="button">清空附件</button>
-              </div>
-              <div class="right-actions">
-                <span class="status" id="sendStatus"></span>
+                </div>
+                <div class="right-actions">
+                  <span class="quota-inline" id="quotaInline">${renderQuotaText()}</span>
+                  <span class="status" id="sendStatus"></span>
                 <button class="btn ghost hidden" id="stopBtn" type="button">停止</button>
                 <button class="btn primary" id="sendBtn" type="button">发送</button>
               </div>
@@ -303,7 +582,15 @@ function renderChatShell() {
           </div>
         </section>
       </main>
+      <aside class="right-rail ${state.rightRailOpen ? '' : 'collapsed'}" id="rightRail" aria-label="历史会话">
+        <div class="right-rail-header">
+          <span>历史会话</span>
+          <button class="right-rail-close" id="rightRailToggle" type="button" title="收起历史会话">收起</button>
+        </div>
+        <div class="right-rail-list" id="rightRailList"></div>
+      </aside>
     </div>
+    <button class="right-rail-tab ${state.rightRailOpen ? 'hidden' : ''}" id="rightRailTab" type="button" title="展开历史会话">历史会话</button>
     <div class="image-preview hidden" id="imagePreview" role="dialog" aria-modal="true" aria-label="图片预览">
       <button class="image-preview-backdrop" id="imagePreviewBackdrop" type="button" aria-label="关闭图片预览"></button>
       <div class="image-preview-panel">
@@ -319,10 +606,12 @@ function renderChatShell() {
       <button class="undo-toast-action" id="undoToastBtn" type="button">撤销</button>
     </div>
     <div class="app-toast hidden" id="appToast" role="status" aria-live="polite"></div>
+    ${renderAgentTutorialModal()}
     <div class="selection-toolbar hidden" id="selectionToolbar" role="toolbar" aria-label="选中文本操作">
       <button class="selection-toolbar-button" data-selection-action="copy" type="button">复制</button>
       <button class="selection-toolbar-button primary" data-selection-action="quote" type="button">追问</button>
     </div>
+    ${renderAccountModal()}
     <div class="command-palette ${state.commandPalette.open ? '' : 'hidden'}" id="commandPalette" role="dialog" aria-modal="true" aria-label="命令面板">
       <button class="command-palette-backdrop" data-command-palette-close type="button" aria-label="关闭命令面板"></button>
       <div class="command-palette-panel">
@@ -334,22 +623,36 @@ function renderChatShell() {
     </div>`;
 
   bindChatEvents();
-  renderConversationList();
-  renderProviderSelect();
-  restoreCurrentComposer();
-}
+    renderConversationList();
+    renderProviderSelect();
+    renderChatModeState();
+    restoreCurrentComposer();
+    updateQuotaUi();
+  }
 
 function bindChatEvents() {
   el('#sidebarToggleBtn')?.addEventListener('click', toggleSidebar);
+  el('#mobileMenuBtn')?.addEventListener('click', toggleMobileSidebar);
+  el('#sidebarBackdrop')?.addEventListener('click', closeMobileSidebar);
+  el('#accountBtn')?.addEventListener('click', () => { closeMobileSidebar(); openAccountModal(); });
+  el('#accountModalClose')?.addEventListener('click', closeAccountModal);
+  el('#accountModalBackdrop')?.addEventListener('click', closeAccountModal);
+  el('#accountModal')?.addEventListener('click', (event) => {
+    const copyBtn = event.target.closest('[data-copy-invite]');
+    if (copyBtn) handleAccountCopy(copyBtn.dataset.copyInvite);
+  });
+  window.removeEventListener('resize', handleMobileSidebarResize);
+  window.addEventListener('resize', handleMobileSidebarResize);
+  el('#rightRailToggle')?.addEventListener('click', toggleRightRail);
+  el('#rightRailTab')?.addEventListener('click', toggleRightRail);
   el('#newConversationBtn')?.addEventListener('click', createConversation);
   el('#logoutBtn')?.addEventListener('click', async () => {
     await api('/logout', { method: 'POST', body: {} });
     state.student = null;
     renderStudentLogin();
   });
-  document.querySelectorAll('[data-provider-select="true"]').forEach((select) => {
-    select.addEventListener('change', handleProviderSelectChange);
-  });
+  document.removeEventListener('mousedown', handleModelDropdownDocumentMousedown);
+  document.addEventListener('mousedown', handleModelDropdownDocumentMousedown);
   el('#conversationSearch')?.addEventListener('input', (event) => {
     state.conversationQuery = event.currentTarget.value.trim();
     renderConversationList();
@@ -360,9 +663,13 @@ function bindChatEvents() {
   el('#conversationFindPrev')?.addEventListener('click', () => stepConversationFind(-1));
   el('#conversationFindNext')?.addEventListener('click', () => stepConversationFind(1));
   el('#conversationFindClear')?.addEventListener('click', clearConversationFind);
+  el('#redeemForm')?.addEventListener('submit', redeemMembershipCode);
   el('#savedMessagesBtn')?.addEventListener('click', toggleSavedMessages);
   el('#archiveConversationsBtn')?.addEventListener('click', toggleArchivedConversations);
   el('#studyMemoryBtn')?.addEventListener('click', toggleStudyMemory);
+  el('#reviewBtn')?.addEventListener('click', toggleReview);
+  el('#practiceBtn')?.addEventListener('click', generatePracticeSet);
+  el('#mockExamBtn')?.addEventListener('click', toggleMockExam);
   el('#messageOutline')?.addEventListener('click', handleMessageOutlineClick);
   el('#topbarRenameBtn')?.addEventListener('click', () => renameConversation(state.currentConversationId));
   el('#topbarCopyLinkBtn')?.addEventListener('click', (event) => copyConversationLink(state.currentConversationId, event.currentTarget));
@@ -383,6 +690,14 @@ function bindChatEvents() {
   el('#importJsonBtn')?.addEventListener('click', () => el('#importJsonInput')?.click());
   el('#importJsonInput')?.addEventListener('change', handleImportJson);
   el('#themeToggleBtn')?.addEventListener('click', toggleTheme);
+  el('#chatModeBtn')?.addEventListener('click', toggleChatMode);
+  document.querySelectorAll('[data-chat-mode-choice]').forEach((button) => {
+    button.addEventListener('click', () => setChatMode(button.dataset.chatModeChoice, { userInitiated: true }));
+  });
+  el('#agentHelpBtn')?.addEventListener('click', () => openAgentTutorial({ focus: true }));
+  el('#agentTutorialClose')?.addEventListener('click', () => closeAgentTutorial({ markSeen: true }));
+  el('#agentTutorialDone')?.addEventListener('click', () => closeAgentTutorial({ markSeen: true }));
+  el('#agentTutorialBackdrop')?.addEventListener('click', () => closeAgentTutorial({ markSeen: true }));
   el('#scrollBottomBtn')?.addEventListener('click', () => scrollMessages(true));
   window.removeEventListener('scroll', handleWindowScroll);
   window.addEventListener('scroll', handleWindowScroll, { passive: true });
@@ -445,6 +760,9 @@ function bindChatEvents() {
   document.addEventListener('mousedown', handleSelectionToolbarDocumentMouseDown);
   window.removeEventListener('resize', closeSelectionToolbar);
   window.addEventListener('resize', closeSelectionToolbar);
+  lastRightRailAvailable = rightRailAvailable();
+  window.removeEventListener('resize', handleRightRailResize);
+  window.addEventListener('resize', handleRightRailResize);
   window.removeEventListener('beforeunload', saveCurrentDraft);
   window.addEventListener('beforeunload', saveCurrentDraft);
   renderUndoToast();
@@ -457,6 +775,152 @@ function toggleSidebar() {
   localStorage.setItem('kc_sidebar_collapsed', state.sidebarCollapsed ? '1' : '0');
   renderChatShell();
   renderMessages(state.currentMessages);
+}
+
+function anyStudyToolActive() {
+  return Boolean(
+    state.savedMessages.open ||
+    state.showArchived ||
+    state.studyMemory.open ||
+    state.review.open ||
+    state.mockExam.open
+  );
+}
+
+function isMobileViewport() {
+  return typeof window !== 'undefined' && window.matchMedia
+    ? window.matchMedia('(max-width: 860px)').matches
+    : false;
+}
+
+function setMobileSidebar(open) {
+  state.mobileSidebarOpen = open;
+  const layout = el('.layout');
+  if (layout) layout.classList.toggle('drawer-open', open);
+  el('#sidebarBackdrop')?.classList.toggle('hidden', !open);
+  el('#mobileMenuBtn')?.setAttribute('aria-expanded', open ? 'true' : 'false');
+  document.body.classList.toggle('drawer-locked', open);
+}
+
+function openMobileSidebar() {
+  setMobileSidebar(true);
+}
+
+function closeMobileSidebar() {
+  if (!state.mobileSidebarOpen) return;
+  setMobileSidebar(false);
+}
+
+function toggleMobileSidebar() {
+  setMobileSidebar(!state.mobileSidebarOpen);
+}
+
+let lastMobileViewport = null;
+function handleMobileSidebarResize() {
+  const mobile = isMobileViewport();
+  if (!mobile && state.mobileSidebarOpen) setMobileSidebar(false);
+  if (lastMobileViewport === null) {
+    lastMobileViewport = mobile;
+    return;
+  }
+  if (mobile !== lastMobileViewport) {
+    lastMobileViewport = mobile;
+    // The desktop "collapsed rail" must not apply on mobile (drawer needs the
+    // full sidebar), so re-render the shell to recompute the layout class.
+    renderChatShell();
+    renderMessages(state.currentMessages);
+  }
+}
+
+function toggleRightRail() {
+  state.rightRailOpen = !state.rightRailOpen;
+  try {
+    localStorage.setItem('kc_right_rail', state.rightRailOpen ? '1' : '0');
+  } catch {}
+  renderRightRail();
+}
+
+function renderRightRail() {
+  const rail = el('#rightRail');
+  const tab = el('#rightRailTab');
+  if (!rail || !tab) return;
+  rail.classList.toggle('collapsed', !state.rightRailOpen);
+  tab.classList.toggle('hidden', state.rightRailOpen);
+  const list = el('#rightRailList');
+  if (!list) return;
+  if (!state.rightRailOpen) {
+    list.innerHTML = '';
+    return;
+  }
+  const conversations = filteredConversations();
+  if (!conversations.length) {
+    list.innerHTML = '<div class="status">暂无会话。</div>';
+    return;
+  }
+  list.innerHTML = conversations.map(renderRightRailItem).join('');
+  list.querySelectorAll('[data-rail-select]').forEach((button) => {
+    button.addEventListener('click', () => selectConversation(button.dataset.railSelect));
+  });
+  list.querySelectorAll('[data-rename-conversation]').forEach((button) => {
+    button.addEventListener('click', () => renameConversation(button.dataset.renameConversation));
+  });
+  list.querySelectorAll('[data-pin-conversation]').forEach((button) => {
+    button.addEventListener('click', () => toggleConversationPin(button.dataset.pinConversation));
+  });
+  list.querySelectorAll('[data-archive-conversation]').forEach((button) => {
+    button.addEventListener('click', () => setConversationArchived(button.dataset.archiveConversation, true));
+  });
+  list.querySelectorAll('[data-restore-conversation]').forEach((button) => {
+    button.addEventListener('click', () => setConversationArchived(button.dataset.restoreConversation, false));
+  });
+  list.querySelectorAll('[data-copy-conversation-link]').forEach((button) => {
+    button.addEventListener('click', () => copyConversationLink(button.dataset.copyConversationLink, button));
+  });
+  list.querySelectorAll('[data-delete-conversation]').forEach((button) => {
+    button.addEventListener('click', () => deleteConversation(button.dataset.deleteConversation));
+  });
+}
+
+function renderRightRailItem(item) {
+  const pinned = Boolean(item.pinned);
+  const archived = Boolean(item.archived);
+  const archiveButton = archived
+    ? `<button class="conversation-action" data-restore-conversation="${escapeAttr(item.id)}" type="button">恢复</button>`
+    : `<button class="conversation-action" data-archive-conversation="${escapeAttr(item.id)}" type="button">归档</button>`;
+  return `
+    <div class="right-rail-item ${item.id === state.currentConversationId ? 'active' : ''} ${pinned ? 'pinned' : ''}" data-id="${escapeAttr(item.id)}">
+      <button class="right-rail-item-main" data-rail-select="${escapeAttr(item.id)}" type="button" title="${escapeAttr(item.title)}">
+        <span class="right-rail-item-title">${escapeHtml(item.title)}</span>
+        <span class="right-rail-item-date">${archived ? '已归档 · ' : ''}${formatTime(item.updated_at)}</span>
+      </button>
+      <div class="right-rail-item-actions">
+        ${archived ? '' : `<button class="conversation-action" data-pin-conversation="${escapeAttr(item.id)}" type="button">${pinned ? '取消置顶' : '置顶'}</button>`}
+        <button class="conversation-action" data-copy-conversation-link="${escapeAttr(item.id)}" type="button">链接</button>
+        ${archiveButton}
+        <button class="conversation-action" data-rename-conversation="${escapeAttr(item.id)}" type="button">改名</button>
+        <button class="conversation-action danger" data-delete-conversation="${escapeAttr(item.id)}" type="button">删除</button>
+      </div>
+    </div>`;
+}
+
+function rightRailAvailable() {
+  return typeof window !== 'undefined' && window.matchMedia
+    ? window.matchMedia('(min-width: 1101px)').matches
+    : true;
+}
+
+let rightRailResizeTimer = null;
+let lastRightRailAvailable = null;
+
+function handleRightRailResize() {
+  clearTimeout(rightRailResizeTimer);
+  rightRailResizeTimer = setTimeout(() => {
+    const available = rightRailAvailable();
+    if (available !== lastRightRailAvailable) {
+      lastRightRailAvailable = available;
+      renderConversationList();
+    }
+  }, 180);
 }
 
 function toggleTheme() {
@@ -474,9 +938,25 @@ function applyTheme(theme) {
   document.documentElement.dataset.theme = theme === 'dark' ? 'dark' : 'light';
 }
 
-function handleProviderSelectChange(event) {
-  state.currentProviderId = Number(event.currentTarget.value) || null;
-  renderProviderSelect();
+function toggleModelDropdown(container) {
+  const isOpen = container.classList.contains('open');
+  closeModelDropdowns();
+  if (isOpen) return;
+  container.classList.add('open');
+  container.querySelector('.model-dropdown-menu')?.classList.remove('hidden');
+  container.querySelector('.model-dropdown-trigger')?.setAttribute('aria-expanded', 'true');
+}
+
+function closeModelDropdowns() {
+  document.querySelectorAll('[data-model-dropdown].open').forEach((container) => {
+    container.classList.remove('open');
+    container.querySelector('.model-dropdown-menu')?.classList.add('hidden');
+    container.querySelector('.model-dropdown-trigger')?.setAttribute('aria-expanded', 'false');
+  });
+}
+
+function handleModelDropdownDocumentMousedown(event) {
+  if (!event.target.closest('[data-model-dropdown]')) closeModelDropdowns();
 }
 
 function initialRouteTarget() {
@@ -536,6 +1016,7 @@ async function loadConversations() {
 
 async function createConversation(options = {}) {
   saveCurrentComposer();
+  closeMobileSidebar();
   const data = await api('/conversations', { method: 'POST', body: { title: '新的答疑', providerId: state.currentProviderId } });
   state.conversations = sortConversations([data.conversation, ...state.conversations]);
   state.currentConversationId = data.conversation.id;
@@ -551,6 +1032,7 @@ async function createConversation(options = {}) {
 async function selectConversation(id, options = {}) {
   saveCurrentComposer();
   state.currentConversationId = id;
+  closeMobileSidebar();
   updateConversationRoute(id, { replace: options.replaceRoute });
   renderConversationList();
   restoreCurrentComposer();
@@ -569,31 +1051,104 @@ async function refreshCurrentConversationMessages(options = {}) {
   renderProviderSelect();
   await renderMessages(data.messages || []);
   if (options.highlightMessageId) focusMessage(options.highlightMessageId);
+  if (!options.skipResume) maybeResumeGeneration();
+}
+
+// 刷新/重连后，若该会话仍有后台进行中的生成，接着把它显示出来（ChatGPT 式「离开也继续」）。
+async function maybeResumeGeneration() {
+  if (state.sending) return;
+  const conversationId = state.currentConversationId;
+  if (!conversationId || state.resumePolling === conversationId) return;
+  let info;
+  try {
+    info = await api(`/chat/active?conversationId=${encodeURIComponent(conversationId)}`);
+  } catch {
+    return;
+  }
+  if (!info || !info.active || state.currentConversationId !== conversationId) return;
+  pollActiveGeneration(conversationId, info.partial || '');
+}
+
+function ensureResumeBubble() {
+  let target = el('#resume_assistant_content');
+  if (target) return target;
+  const box = el('#messages');
+  if (!box) return null;
+  const empty = box.querySelector('.empty-state');
+  if (empty) empty.remove();
+  box.insertAdjacentHTML('beforeend', `
+    <article class="message assistant" data-message-id="resume_assistant">
+      <div class="message-role">助手</div>
+      <div class="message-card">
+        <div class="think-line"><span class="think-badge">实时</span><span class="think-text">正在后台继续生成，请稍候…</span></div>
+        <div class="message-content streaming" id="resume_assistant_content"></div>
+      </div>
+    </article>`);
+  scrollMessages(true);
+  return el('#resume_assistant_content');
+}
+
+async function pollActiveGeneration(conversationId, initialPartial = '') {
+  if (state.resumePolling === conversationId) return;
+  state.resumePolling = conversationId;
+  const target = ensureResumeBubble();
+  if (target && initialPartial) scheduleStreamingRender(target, initialPartial);
+  try {
+    while (state.currentConversationId === conversationId && !state.sending) {
+      let info;
+      try {
+        info = await api(`/chat/active?conversationId=${encodeURIComponent(conversationId)}`);
+      } catch {
+        break;
+      }
+      if (!info || !info.active) break;
+      const t = el('#resume_assistant_content');
+      if (t) {
+        scheduleStreamingRender(t, info.partial || '');
+        scrollMessages();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    }
+  } finally {
+    state.resumePolling = null;
+    el('#resume_assistant')?.remove();
+    if (state.currentConversationId === conversationId && !state.sending) {
+      await refreshCurrentConversationMessages({ skipResume: true });
+    }
+  }
 }
 
 function renderConversationList() {
+  renderRightRail();
   const list = el('#conversationList');
   if (!list) return;
   updateSavedMessagesToggle();
   updateArchiveConversationsToggle();
   updateStudyMemoryToggle();
+  updateMockExamToggle();
   const query = normalizeSearchText(state.conversationQuery);
   const conversations = filteredConversations();
   const sections = [];
   if (state.studyMemory.open) {
     sections.push(renderStudyMemoryPanel());
   }
+  if (state.mockExam.open) {
+    sections.push(renderMockExamPanel());
+  }
+  if (state.review.open) {
+    sections.push(renderReviewPanel());
+  }
   if (state.savedMessages.open) {
     sections.push(`
-	      <div class="saved-review-header">
-	        <span>复习收藏</span>
-	        <div class="saved-review-actions">
-	          <button class="conversation-action" data-export-saved="md" type="button">收藏 MD</button>
-	          <button class="conversation-action" data-export-saved="pdf" type="button">收藏 PDF</button>
-	          <button class="conversation-action" data-export-saved="json" type="button">收藏 JSON</button>
-	          <button class="conversation-action" data-export-saved="csv" type="button">收藏 CSV</button>
-	        </div>
-	      </div>`);
+        <div class="saved-review-header">
+          <span>复习收藏</span>
+          <div class="saved-review-actions">
+            <button class="conversation-action" data-export-saved="md" type="button">收藏 MD</button>
+            <button class="conversation-action" data-export-saved="pdf" type="button">收藏 PDF</button>
+            <button class="conversation-action" data-export-saved="json" type="button">收藏 JSON</button>
+            <button class="conversation-action" data-export-saved="csv" type="button">收藏 CSV</button>
+          </div>
+        </div>`);
     if (state.savedMessages.loading) {
       sections.push(`<div class="status">正在加载复习收藏...</div>`);
     } else if (state.savedMessages.error) {
@@ -607,8 +1162,10 @@ function renderConversationList() {
       sections.push(`<div class="status">还没有收藏的消息。</div>`);
     }
   }
-  if (conversations.length) sections.push(conversations.map(renderConversationItem).join(''));
-  else if (!query && !state.savedMessages.open && !state.studyMemory.open) {
+  const railTakesConversations = rightRailAvailable();
+  if (conversations.length) {
+    if (!railTakesConversations) sections.push(conversations.map(renderConversationItem).join(''));
+  } else if (!query && !state.savedMessages.open && !state.studyMemory.open) {
     sections.push(`<div class="status">${state.showArchived ? '暂无归档会话。' : '暂无会话，点击“新建”开始。'}</div>`);
   }
   if (query.length >= 2) {
@@ -624,7 +1181,9 @@ function renderConversationList() {
     }
   }
   if (!sections.length) {
-    list.innerHTML = `<div class="status">${query ? '未找到会话或消息。' : '暂无会话，点击“新建”开始。'}</div>`;
+    list.innerHTML = railTakesConversations && conversations.length
+      ? ''
+      : `<div class="status">${query ? '未找到会话或消息。' : '暂无会话，点击“新建”开始。'}</div>`;
     return;
   }
   list.innerHTML = sections.join('');
@@ -640,6 +1199,32 @@ function renderConversationList() {
   list.querySelectorAll('[data-memory-action="refresh"]').forEach((button) => {
     button.addEventListener('click', () => refreshStudyMemory());
   });
+  list.querySelector('[data-mock-exam-close]')?.addEventListener('click', toggleMockExam);
+  list.querySelector('[data-mock-exam-generate]')?.addEventListener('click', generateMockExam);
+  list.querySelector('[data-mock-exam-submit]')?.addEventListener('click', submitMockExam);
+  const examAnswer = list.querySelector('#mockExamAnswers');
+  if (examAnswer) {
+    examAnswer.addEventListener('input', (event) => {
+      state.mockExam.answers = event.currentTarget.value;
+    });
+  }
+  list.querySelector('[data-review-close]')?.addEventListener('click', toggleReview);
+  list.querySelector('[data-review-reveal]')?.addEventListener('click', revealReviewCard);
+  list.querySelector('[data-review-restart]')?.addEventListener('click', () => loadReviewSession().then(renderConversationList));
+  list.querySelectorAll('[data-review-grade]').forEach((button) => {
+    button.addEventListener('click', () => gradeReviewCard(Number(button.dataset.reviewGrade)));
+  });
+  list.querySelector('[data-review-remove]')?.addEventListener('click', (event) => {
+    removeReviewCard(event.currentTarget.dataset.reviewRemove);
+  });
+  if (state.review.open && !state.review.loading) {
+    const panel = el('#reviewPanel');
+    if (panel) setTimeout(() => ensureMathRendered(panel).catch(() => {}), 0);
+  }
+  if (state.mockExam.open && !state.mockExam.loading) {
+    const panel = el('#mockExamPanel');
+    if (panel) setTimeout(() => ensureMathRendered(panel).catch(() => {}), 0);
+  }
   list.querySelectorAll('[data-memory-export]').forEach((button) => {
     button.addEventListener('click', () => exportStudyMemory(button.dataset.memoryExport || 'md'));
   });
@@ -687,9 +1272,18 @@ function updateStudyMemoryToggle() {
   button.textContent = state.studyMemory.open ? '关闭学习记忆' : '学习记忆';
 }
 
+function updateMockExamToggle() {
+  const button = el('#mockExamBtn');
+  if (!button) return;
+  button.classList.toggle('active', Boolean(state.mockExam.open));
+  button.setAttribute('aria-pressed', state.mockExam.open ? 'true' : 'false');
+  button.textContent = state.mockExam.open ? '关闭模拟考' : '模拟考模式';
+}
+
 function renderStudyMemoryPanel() {
   const memory = normalizedStudyMemory();
   const topics = studyMemoryTopicEntries(memory);
+  const mastery = state.studyMemory.topicMastery;
   const profileEntries = Object.entries(memory.profile || {})
     .filter(([, value]) => String(value || '').trim())
     .slice(0, 6);
@@ -708,11 +1302,22 @@ function renderStudyMemoryPanel() {
       <div class="study-memory-meta">更新：${escapeHtml(updatedAt)}</div>
       ${state.studyMemory.loading ? '<div class="status">正在读取学习记忆...</div>' : ''}
       ${state.studyMemory.error ? `<div class="status error">${escapeHtml(state.studyMemory.error)}</div>` : ''}
+      ${memory.summary ? `
+      <div class="study-memory-section">
+        <div class="study-memory-section-title">画像总结</div>
+        <div class="study-memory-summary">${escapeHtml(memory.summary)}</div>
+      </div>` : ''}
       <div class="study-memory-section">
         <div class="study-memory-section-title">画像</div>
         ${profileEntries.length
           ? `<div class="study-memory-profile">${profileEntries.map(([key, value]) => `<span>${escapeHtml(studyMemoryProfileLabel(key))}：${escapeHtml(value)}</span>`).join('')}</div>`
           : '<div class="study-memory-empty">暂无画像信息。</div>'}
+      </div>
+      <div class="study-memory-section">
+        <div class="study-memory-section-title">薄弱点</div>
+        ${memory.weakPoints.length
+          ? `<ol class="study-memory-questions">${memory.weakPoints.slice(0, 8).map((item) => `<li>${escapeHtml(String(item?.point || ''))}（${Number(item?.count) || 1}次）${item?.evidence ? `：${escapeHtml(String(item.evidence))}` : ''}</li>`).join('')}</ol>`
+          : '<div class="study-memory-empty">暂无薄弱点记录，多问几题就会自动归纳。</div>'}
       </div>
       <div class="study-memory-section">
         <div class="study-memory-section-title">高频主题</div>
@@ -721,12 +1326,61 @@ function renderStudyMemoryPanel() {
           : '<div class="study-memory-empty">暂无主题记录。</div>'}
       </div>
       <div class="study-memory-section">
+        <div class="study-memory-section-title">考点掌握热力图</div>
+        ${renderTopicHeatmap(mastery)}
+      </div>
+      <div class="study-memory-section">
         <div class="study-memory-section-title">最近问题</div>
         ${recentQuestions.length
           ? `<ol class="study-memory-questions">${recentQuestions.map((question) => `<li>${escapeHtml(question)}</li>`).join('')}</ol>`
           : '<div class="study-memory-empty">暂无最近问题。</div>'}
       </div>
     </section>`;
+}
+
+function renderTopicHeatmap(mastery) {
+  if (!mastery || !Array.isArray(mastery.tree)) {
+    return '<div class="study-memory-empty">暂无考点热力图，多完成几次答疑后会自动点亮。</div>';
+  }
+  const redTopics = Array.isArray(mastery.redTopics) ? mastery.redTopics : [];
+  const roots = mastery.tree || [];
+  return `
+    ${redTopics.length ? `
+      <div class="topic-redline">
+        ${redTopics.slice(0, 4).map((topic) => `<span>${escapeHtml(topic.path || topic.label)} · ${topic.score ?? 0}</span>`).join('')}
+      </div>` : '<div class="study-memory-empty">当前没有明显红区考点。</div>'}
+    <div class="topic-heatmap">
+      ${roots.map((root) => renderTopicHeatGroup(root)).join('')}
+    </div>`;
+}
+
+function renderTopicHeatGroup(root) {
+  const leaves = flattenTopicLeaves(root);
+  if (!leaves.length) return '';
+  return `
+    <div class="topic-heat-group">
+      <div class="topic-heat-group-title">${escapeHtml(root.label)}</div>
+      <div class="topic-heat-nodes">
+        ${leaves.map(renderTopicHeatNode).join('')}
+      </div>
+    </div>`;
+}
+
+function flattenTopicLeaves(node) {
+  if (!node) return [];
+  if (!Array.isArray(node.children) || !node.children.length) return [node];
+  return node.children.flatMap(flattenTopicLeaves);
+}
+
+function renderTopicHeatNode(topic) {
+  const level = ['red', 'yellow', 'green', 'empty'].includes(topic.level) ? topic.level : 'empty';
+  const score = topic.score == null ? '-' : String(topic.score);
+  const title = `${topic.path || topic.label}｜掌握度 ${score}｜出现 ${topic.seen || 0}｜薄弱 ${topic.weak || 0}`;
+  return `
+    <span class="topic-heat-node heat-${level}" title="${escapeAttr(title)}">
+      <b>${escapeHtml(topic.label)}</b>
+      <small>${escapeHtml(score)}</small>
+    </span>`;
 }
 
 function renderPromptLibraryPanel() {
@@ -745,6 +1399,160 @@ function renderPromptLibraryPanel() {
       ${customPrompts.length
         ? customPrompts.map(renderCustomPromptItem).join('')
         : '<div class="custom-prompt-empty">暂无自定义模板。</div>'}
+    </div>`;
+}
+
+function renderModeSwitchPanel() {
+  const agentActive = state.chatMode === 'agent';
+  return `
+    <div class="mode-switch-panel" id="modeSwitchPanel" aria-label="答疑模式">
+      <div class="mode-segment">
+        <button class="mode-choice ${agentActive ? '' : 'active'}" data-chat-mode-choice="qa" type="button" aria-pressed="${agentActive ? 'false' : 'true'}" title="直接回答，适合快问快答">普通问答</button>
+        <button class="mode-choice ${agentActive ? 'active' : ''}" data-chat-mode-choice="agent" type="button" aria-pressed="${agentActive ? 'true' : 'false'}" title="先规划再解题，自动公式验算 / 知识库检索">Agent 解题</button>
+      </div>
+      <button class="agent-help-btn" id="agentHelpBtn" type="button" title="使用教程" aria-label="使用教程">教程</button>
+    </div>`;
+}
+
+function renderAccountModal() {
+  return `
+    <div class="account-modal ${state.accountOpen ? '' : 'hidden'}" id="accountModal" role="dialog" aria-modal="true" aria-label="我的账户">
+      <button class="account-modal-backdrop" id="accountModalBackdrop" type="button" aria-label="关闭"></button>
+      <div class="account-modal-panel">
+        <div class="account-modal-header">
+          <h2>我的账户</h2>
+          <button class="account-modal-close" id="accountModalClose" type="button">关闭</button>
+        </div>
+        <div class="account-modal-body" id="accountModalBody">${renderAccountBody()}</div>
+      </div>
+    </div>`;
+}
+
+function accountAccessLine(access, label) {
+  let value = '未开通';
+  if (access) {
+    if (access.status === 'paid') value = `已开通 · 到 ${formatDateOnly(access.paidUntil || access.accessEndAt)}`;
+    else if (access.status === 'trial') value = `试用中 · 剩约 ${Number(access.remainingDays || 0)} 天`;
+    else if (access.status === 'trial_available') value = `可试用 ${Number(access.trialDays || 14)} 天`;
+  }
+  return `<div class="account-row"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`;
+}
+
+function formatYuan(cents) {
+  return `¥${(Math.max(0, Number(cents || 0)) / 100).toFixed(0)}`;
+}
+
+function renderAccountBody() {
+  const q = state.quota || {};
+  const inv = state.invite || {};
+  const reds = state.redemptions || [];
+  const planText = (q.plan && q.plan !== 'free')
+    ? `${q.planLabel || q.plan} · 剩 ${Math.max(0, Number(q.remaining || 0))}/${Math.max(0, Number(q.limit || 0))} 点${q.membershipExpiresAt ? ` · 到期 ${formatDateOnly(q.membershipExpiresAt)}` : ''}`
+    : `免费 · 今日剩 ${Math.max(0, Number(q.remaining || 0))}/${Math.max(0, Number(q.limit || 0))}`;
+  return `
+    <section class="account-section">
+      <h3>我的权益</h3>
+      <div class="account-row"><span>答疑额度</span><b>${escapeHtml(planText)}</b></div>
+      ${accountAccessLine(state.zhentiAccess, '数学 / 英语真题')}
+      ${accountAccessLine(state.tongjiAccess, '432 统计真题')}
+    </section>
+    <section class="account-section">
+      <h3>邀请有奖</h3>
+      <p class="account-hint">${escapeHtml(inv.rewardText || '把链接发给同学，对方兑换成功后你可获得邀请奖励。')}</p>
+      <div class="account-invite">
+        <div class="account-invite-code"><span>邀请码</span><b>${escapeHtml(inv.code || '—')}</b></div>
+        <div class="account-invite-actions">
+          <button class="btn" data-copy-invite="code" type="button">复制邀请码</button>
+          <button class="btn primary" data-copy-invite="link" type="button">复制邀请链接</button>
+        </div>
+      </div>
+      <div class="account-stats">
+        <div><b>${Number(inv.invitedCount || 0)}</b><span>已邀请</span></div>
+        <div><b>${formatYuan(inv.pendingCents)}</b><span>待发放</span></div>
+        <div><b>${formatYuan(inv.claimedCents)}</b><span>已发放</span></div>
+      </div>
+    </section>
+    <section class="account-section">
+      <h3>兑换记录</h3>
+      ${reds.length
+        ? `<ul class="account-redemptions">${reds.map((r) => `<li><span>${escapeHtml(r.planLabel || r.plan)}</span><code>${escapeHtml(r.code)}</code><time>${escapeHtml(formatDateOnly(r.redeemedAt))}</time></li>`).join('')}</ul>`
+        : '<div class="account-empty">还没有兑换记录。兑换后会显示在这里。</div>'}
+    </section>`;
+}
+
+function openAccountModal() {
+  state.accountOpen = true;
+  const body = el('#accountModalBody');
+  if (body) body.innerHTML = renderAccountBody();
+  el('#accountModal')?.classList.remove('hidden');
+}
+
+function closeAccountModal() {
+  state.accountOpen = false;
+  el('#accountModal')?.classList.add('hidden');
+}
+
+async function handleAccountCopy(kind) {
+  const inv = state.invite || {};
+  const text = kind === 'link' ? (inv.link || '') : (inv.code || '');
+  if (!text) {
+    showToast('暂无可复制内容', { error: true });
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(kind === 'link' ? '邀请链接已复制' : '邀请码已复制');
+  } catch {
+    showToast('复制失败，请长按手动复制', { error: true });
+  }
+}
+
+function renderAgentTutorialModal() {
+  return `
+    <div class="agent-tutorial ${state.agentTutorialOpen ? '' : 'hidden'}" id="agentTutorial" role="dialog" aria-modal="true" aria-labelledby="agentTutorialTitle">
+      <button class="agent-tutorial-backdrop" id="agentTutorialBackdrop" type="button" aria-label="关闭使用教程"></button>
+      <div class="agent-tutorial-panel">
+        <div class="agent-tutorial-header">
+          <div>
+            <div class="agent-tutorial-kicker">使用教程</div>
+            <h2 id="agentTutorialTitle">两种模式怎么用</h2>
+          </div>
+          <button class="agent-tutorial-close" id="agentTutorialClose" type="button">关闭</button>
+        </div>
+        <div class="tutorial-video-wrap">
+          <video id="agentTutorialVideo" class="tutorial-video" src="/chat/assets/agent-tutorial.mp4?v=20260610-agent-5" preload="none" muted loop playsinline controls aria-label="Agent 模式 20 秒演示"></video>
+          <div class="tutorial-video-caption">20 秒演示：切模式 → 发完整题干 → 看执行记录 → 拿到验算过的答案</div>
+        </div>
+        <div class="agent-tutorial-grid tutorial-mode-grid">
+          <section class="tutorial-mode-card tutorial-mode-qa">
+            <h3>普通问答<span class="tutorial-current-badge">当前</span></h3>
+            <p><b>适合：</b>查概念、背景知识、对个答案、口算级的小问题。</p>
+            <p><b>特点：</b>直接回答、响应最快、不调用工具。一句话提问就行，问完即走。</p>
+          </section>
+          <section class="tutorial-mode-card tutorial-mode-agent">
+            <h3>Agent 解题<span class="tutorial-current-badge">当前</span></h3>
+            <p><b>适合：</b>复杂推导、概率统计、408 算法、图片题、需要验算的大题。</p>
+            <p><b>特点：</b>先规划再解题，自动用 SymPy 验算、检索本站知识库；回答上方会显示执行记录。一次发完整题干最稳。</p>
+          </section>
+        </div>
+        <div class="agent-tutorial-grid">
+          <section>
+            <h3>怎么切换</h3>
+            <p>输入框上方点「普通问答 / Agent 解题」两个按钮即可切换，选择会被记住；也可在命令面板里搜“模式”。</p>
+          </section>
+          <section>
+            <h3>怎么看 Agent 执行记录</h3>
+            <p>Agent 回答上方会列出人设选择、公式验算、知识库检索等步骤，可据此判断它用了哪些工具来核对。</p>
+          </section>
+        </div>
+        <div class="agent-tutorial-example">
+          <b>Agent 推荐写法</b>
+          <span>“这道概率统计题请完整推导，并检查我第二步的条件概率是否写反了。”</span>
+        </div>
+        <div class="agent-tutorial-actions">
+          <button class="btn primary" id="agentTutorialDone" type="button">知道了</button>
+        </div>
+      </div>
     </div>`;
 }
 
@@ -789,6 +1597,20 @@ function commandPaletteCommands() {
       detail: '管理和套用自定义 prompt 模板',
       keywords: 'prompt library template 模板 常用',
       run: () => openPromptLibraryFromCommand()
+    },
+    {
+      id: 'toggle-agent-mode',
+      label: state.chatMode === 'agent' ? '切换到普通问答' : '切换到 Agent 解题',
+      detail: state.chatMode === 'agent' ? '关闭工具调用，使用更直接的普通回答' : '启用人设路由、公式验算与知识库检索等工具',
+      keywords: 'agent mode qa 模式 普通 问答 教程',
+      run: () => setChatMode(state.chatMode === 'agent' ? 'qa' : 'agent', { userInitiated: true })
+    },
+    {
+      id: 'agent-tutorial',
+      label: '打开使用教程',
+      detail: '查看普通问答和 Agent 解题分别怎么用、怎么切换、怎么看执行记录',
+      keywords: 'agent tutorial help 教程 使用 方法 普通 问答 模式',
+      run: () => openAgentTutorial({ focus: true })
     },
     {
       id: 'save-prompt',
@@ -1141,7 +1963,12 @@ function scheduleMessageSearch(query) {
 
 async function toggleSavedMessages() {
   state.savedMessages.open = !state.savedMessages.open;
-  if (state.savedMessages.open) state.studyMemory.open = false;
+  if (state.savedMessages.open) {
+    state.studyMemory.open = false;
+    state.mockExam.open = false;
+    state.review.open = false;
+    clearInterval(mockExamTicker);
+  }
   if (state.savedMessages.open) {
     await loadSavedMessages();
   } else {
@@ -1171,10 +1998,289 @@ async function toggleArchivedConversations() {
   clearCurrentConversationView();
 }
 
+function updateReviewButton() {
+  const button = el('#reviewBtn');
+  if (!button) return;
+  const due = state.review.summary?.due || 0;
+  button.textContent = due > 0 ? `今日复习 · ${due}` : '今日复习';
+  button.classList.toggle('has-due', due > 0);
+  button.classList.toggle('active', Boolean(state.review.open));
+}
+
+async function loadReviewSummary() {
+  try {
+    state.review.summary = await api('/review/summary');
+    updateReviewButton();
+  } catch {}
+}
+
+async function loadReviewSession() {
+  state.review.loading = true;
+  state.review.error = '';
+  renderConversationList();
+  try {
+    const [summary, due] = await Promise.all([api('/review/summary'), api('/review/due')]);
+    state.review.summary = summary;
+    state.review.cards = due.cards || [];
+    state.review.index = 0;
+    state.review.revealed = false;
+  } catch (err) {
+    state.review.error = err.message || '复习加载失败。';
+  }
+  state.review.loading = false;
+}
+
+async function toggleReview() {
+  state.review.open = !state.review.open;
+  if (state.review.open) {
+    state.savedMessages.open = false;
+    state.studyMemory.open = false;
+    state.mockExam.open = false;
+    clearInterval(mockExamTicker);
+    await loadReviewSession();
+  }
+  updateReviewButton();
+  renderConversationList();
+}
+
+function revealReviewCard() {
+  state.review.revealed = true;
+  renderConversationList();
+}
+
+async function gradeReviewCard(grade) {
+  const card = state.review.cards[state.review.index];
+  if (!card) return;
+  try {
+    await api(`/review/cards/${card.id}/grade`, { method: 'POST', body: { grade } });
+  } catch (err) {
+    showToast(`评分失败：${err.message}`, { error: true });
+    return;
+  }
+  state.review.index += 1;
+  state.review.revealed = false;
+  if (state.review.index >= state.review.cards.length) await loadReviewSummary();
+  renderConversationList();
+}
+
+async function removeReviewCard(cardId) {
+  if (!cardId) return;
+  try {
+    await api(`/review/cards/${cardId}`, { method: 'DELETE' });
+  } catch (err) {
+    showToast(`移除失败：${err.message}`, { error: true });
+    return;
+  }
+  state.review.cards = state.review.cards.filter((c) => c.id !== cardId);
+  if (state.review.index >= state.review.cards.length) state.review.index = state.review.cards.length;
+  state.review.revealed = false;
+  await loadReviewSummary();
+  renderConversationList();
+}
+
+async function addMessageToReview(messageId, button) {
+  if (!messageId) return;
+  try {
+    const data = await api('/review/cards', { method: 'POST', body: { messageId } });
+    flashButtonText(button, data.duplicate ? '已在复习本' : '已加入复习');
+    await loadReviewSummary();
+  } catch (err) {
+    showToast(`加入失败：${err.message}`, { error: true });
+  }
+}
+
+function renderReviewPanel() {
+  const r = state.review;
+  const header = `
+    <div class="review-head">
+      <span>今日复习${r.summary ? ` · 共 ${r.summary.total} 张` : ''}</span>
+      <button class="conversation-action" data-review-close type="button">关闭</button>
+    </div>`;
+  if (r.loading) {
+    return `<section class="review-panel" id="reviewPanel">${header}<div class="status">正在加载复习卡片...</div></section>`;
+  }
+  if (r.error) {
+    return `<section class="review-panel" id="reviewPanel">${header}<div class="status error">${escapeHtml(r.error)}</div></section>`;
+  }
+  const cards = r.cards || [];
+  if (!cards.length) {
+    const tip = r.summary && r.summary.total
+      ? '今天没有到期的卡片，明天再来复习。'
+      : '复习本还是空的。在任意答疑回答的「更多」菜单里点「加入复习」，错题就会进来，之后按记忆曲线提醒你复习。';
+    return `<section class="review-panel" id="reviewPanel">${header}<div class="review-empty">${escapeHtml(tip)}</div></section>`;
+  }
+  if (r.index >= cards.length) {
+    return `<section class="review-panel" id="reviewPanel">${header}
+      <div class="review-done">本轮 ${cards.length} 张卡片复习完成 🎉</div>
+      <button class="btn ghost" data-review-restart type="button">再查一遍到期卡片</button>
+    </section>`;
+  }
+  const card = cards[r.index];
+  const progress = `${r.index + 1} / ${cards.length}`;
+  const topicTag = card.topic ? `<span class="review-topic">${escapeHtml(card.topic)}</span>` : '';
+  const back = r.revealed
+    ? `<div class="review-back">${renderMarkdown(card.back)}</div>
+       <div class="review-grades">
+         <button class="review-grade again" data-review-grade="0" type="button">忘记</button>
+         <button class="review-grade hard" data-review-grade="1" type="button">模糊</button>
+         <button class="review-grade good" data-review-grade="2" type="button">记得</button>
+         <button class="review-grade easy" data-review-grade="3" type="button">简单</button>
+       </div>`
+    : `<button class="btn primary review-reveal" data-review-reveal type="button">显示答案</button>`;
+  return `<section class="review-panel" id="reviewPanel">
+    ${header}
+    <div class="review-progress">${progress}${topicTag}</div>
+    <div class="review-front">${renderMarkdown(card.front)}</div>
+    ${back}
+    <button class="review-remove" data-review-remove="${escapeAttr(card.id)}" type="button">从复习本移除这张</button>
+  </section>`;
+}
+
+function renderMockExamPanel() {
+  const m = state.mockExam;
+  const exam = m.exam;
+  const header = `
+    <div class="mock-exam-head">
+      <span>模拟考${exam ? ` · ${escapeHtml(exam.title || '')}` : ''}</span>
+      <button class="conversation-action" data-mock-exam-close type="button">关闭</button>
+    </div>`;
+  if (m.loading) {
+    return `<section class="mock-exam-panel" id="mockExamPanel">${header}<div class="status">正在生成模拟考，约需 1 分钟...</div></section>`;
+  }
+  if (m.error && !exam) {
+    return `<section class="mock-exam-panel" id="mockExamPanel">${header}<div class="status error">${escapeHtml(m.error)}</div><button class="btn primary" data-mock-exam-generate type="button">重新生成</button></section>`;
+  }
+  if (!exam) {
+    return `<section class="mock-exam-panel" id="mockExamPanel">
+      ${header}
+      <div class="mock-exam-empty">按最近问答和红区薄弱点生成一套限时小卷，交卷后自动批改并写入学习记忆。</div>
+      <button class="btn primary" data-mock-exam-generate type="button">生成模拟考</button>
+    </section>`;
+  }
+  const submitted = exam.status === 'submitted';
+  const remaining = mockExamRemainingText(exam);
+  return `<section class="mock-exam-panel" id="mockExamPanel">
+    ${header}
+    <div class="mock-exam-meta">
+      <span>限时 ${Number(exam.durationMinutes || 40)} 分钟</span>
+      <span id="mockExamTimer">${submitted ? `成绩 ${exam.score ?? '-'} / 100` : remaining}</span>
+    </div>
+    ${m.error ? `<div class="status error">${escapeHtml(m.error)}</div>` : ''}
+    <div class="mock-exam-paper">${renderMarkdown(exam.questionsMarkdown || '')}</div>
+    ${submitted ? `
+      <div class="mock-exam-result">
+        <div class="mock-exam-section-title">批改报告</div>
+        ${renderMarkdown(exam.reportMarkdown || '')}
+      </div>
+      ${exam.answerKeyMarkdown ? `<details class="mock-exam-answer-key"><summary>参考答案与评分细则</summary>${renderMarkdown(exam.answerKeyMarkdown)}</details>` : ''}`
+    : `
+      <textarea class="mock-exam-answers" id="mockExamAnswers" placeholder="按题号填写你的作答，交卷后会自动批改。">${escapeHtml(m.answers || exam.userAnswersMarkdown || '')}</textarea>
+      <button class="btn primary" data-mock-exam-submit type="button" ${m.submitting ? 'disabled' : ''}>${m.submitting ? '正在批改...' : '交卷并批改'}</button>`}
+  </section>`;
+}
+
+function mockExamRemainingText(exam) {
+  const started = Date.parse(exam?.startsAt || '');
+  const duration = Number(exam?.durationMinutes || 40) * 60000;
+  if (!started || !duration) return '计时中';
+  const remaining = Math.max(0, started + duration - state.mockExam.now);
+  const minutes = Math.floor(remaining / 60000);
+  const seconds = Math.floor((remaining % 60000) / 1000);
+  return `剩余 ${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+async function generatePracticeSet() {
+  const button = el('#practiceBtn');
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  const original = button.textContent;
+  button.textContent = '正在出题，约需 1 分钟...';
+  try {
+    const data = await api('/practice/generate', { method: 'POST', body: {} });
+    await loadConversations();
+    if (data.conversationId) await selectConversation(data.conversationId);
+    showToast(`巩固练习已生成${typeof data.remaining === 'number' ? `，今天还可生成 ${data.remaining} 套` : ''}。`, { timeout: 4600 });
+  } catch (err) {
+    showToast(`生成失败：${err.message}`, { error: true });
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+async function toggleMockExam() {
+  state.mockExam.open = !state.mockExam.open;
+  if (state.mockExam.open) {
+    state.savedMessages.open = false;
+    state.studyMemory.open = false;
+    state.review.open = false;
+    state.mockExam.now = Date.now();
+    renderConversationList();
+    startMockExamTicker();
+    return;
+  }
+  clearInterval(mockExamTicker);
+  renderConversationList();
+}
+
+let mockExamTicker = 0;
+function startMockExamTicker() {
+  clearInterval(mockExamTicker);
+  if (!state.mockExam.open) return;
+  mockExamTicker = setInterval(() => {
+    if (!state.mockExam.open) {
+      clearInterval(mockExamTicker);
+      return;
+    }
+    state.mockExam.now = Date.now();
+    const timer = el('#mockExamTimer');
+    if (timer && state.mockExam.exam && state.mockExam.exam.status !== 'submitted') {
+      timer.textContent = mockExamRemainingText(state.mockExam.exam);
+    }
+  }, 1000);
+}
+
+async function generateMockExam() {
+  if (state.mockExam.loading) return;
+  state.mockExam = { ...state.mockExam, open: true, loading: true, error: '', exam: null, answers: '', now: Date.now() };
+  renderConversationList();
+  try {
+    const data = await api('/mock-exams', { method: 'POST', body: { durationMinutes: 40 } });
+    state.mockExam = { ...state.mockExam, loading: false, error: '', exam: data.exam || null, answers: '' };
+    startMockExamTicker();
+  } catch (err) {
+    state.mockExam = { ...state.mockExam, loading: false, error: err.message || '模拟考生成失败。' };
+  }
+  renderConversationList();
+}
+
+async function submitMockExam() {
+  const exam = state.mockExam.exam;
+  if (!exam || state.mockExam.submitting) return;
+  const answers = String(state.mockExam.answers || el('#mockExamAnswers')?.value || '').trim();
+  if (answers.length < 8) {
+    showToast('请先填写作答内容。', { error: true });
+    return;
+  }
+  state.mockExam = { ...state.mockExam, submitting: true, answers };
+  renderConversationList();
+  try {
+    const data = await api(`/mock-exams/${encodeURIComponent(exam.id)}/submit`, { method: 'POST', body: { answers } });
+    state.mockExam = { ...state.mockExam, submitting: false, error: '', exam: data.exam || exam, answers };
+    await refreshStudyMemoryAfterAnswer();
+    showToast('模拟考已批改，成绩已写入学习记忆。', { timeout: 4200 });
+  } catch (err) {
+    state.mockExam = { ...state.mockExam, submitting: false, error: err.message || '批改失败。' };
+  }
+  renderConversationList();
+}
+
 async function toggleStudyMemory() {
   state.studyMemory.open = !state.studyMemory.open;
   if (state.studyMemory.open) {
     state.savedMessages.open = false;
+    state.mockExam.open = false;
+    clearInterval(mockExamTicker);
     await refreshStudyMemory();
     return;
   }
@@ -1188,9 +2294,9 @@ async function refreshStudyMemory(options = {}) {
     if (shouldRender) renderConversationList();
   }
   try {
-    const data = await api('/me');
+    const [data, masteryData] = await Promise.all([api('/me'), api('/topics/mastery')]);
     if (data.student) state.student = { ...state.student, ...data.student };
-    state.studyMemory = { ...state.studyMemory, loading: false, error: '' };
+    state.studyMemory = { ...state.studyMemory, loading: false, error: '', topicMastery: masteryData.mastery || null };
   } catch (err) {
     state.studyMemory = { ...state.studyMemory, loading: false, error: err.message || '学习记忆读取失败。' };
   }
@@ -1200,8 +2306,9 @@ async function refreshStudyMemory(options = {}) {
 async function refreshStudyMemoryAfterAnswer() {
   if (!state.student) return;
   try {
-    const data = await api('/me');
+    const [data, masteryData] = await Promise.all([api('/me'), api('/topics/mastery')]);
     if (data.student) state.student = { ...state.student, ...data.student };
+    state.studyMemory = { ...state.studyMemory, topicMastery: masteryData.mastery || state.studyMemory.topicMastery || null };
     if (state.studyMemory.open) renderConversationList();
   } catch {}
 }
@@ -1432,26 +2539,268 @@ function renderUndoToast() {
 }
 
 function renderProviderSelect() {
-  const selects = [...document.querySelectorAll('[data-provider-select="true"]')];
-  if (!selects.length) return;
-  if (!state.providers.length) {
-    for (const select of selects) {
-      select.innerHTML = `<option value="">暂无可用模型</option>`;
-      select.disabled = true;
-    }
-    return;
-  }
-  if (!state.currentProviderId || !state.providers.some((p) => p.id === state.currentProviderId)) {
+  const containers = [...document.querySelectorAll('[data-model-dropdown]')];
+  if (!containers.length) return;
+  const hasProviders = state.providers.length > 0;
+  if (hasProviders && (!state.currentProviderId || !state.providers.some((p) => p.id === state.currentProviderId))) {
     const defaultProvider = state.providers.find((p) => p.is_default) || state.providers[0];
     state.currentProviderId = defaultProvider?.id || null;
   }
-  const options = state.providers
-    .map((p) => `<option value="${p.id}">${escapeHtml(p.name)}</option>`)
-    .join('');
-  for (const select of selects) {
-    select.disabled = false;
-    select.innerHTML = options;
-    select.value = state.currentProviderId || '';
+  const current = state.providers.find((p) => p.id === state.currentProviderId) || null;
+  for (const container of containers) {
+    const wasOpen = container.classList.contains('open');
+    container.innerHTML = `
+      <button class="model-select model-dropdown-trigger" type="button" aria-haspopup="listbox" aria-expanded="${wasOpen ? 'true' : 'false'}" ${hasProviders ? '' : 'disabled'}>
+        <span class="model-dropdown-label">${escapeHtml(current ? providerOptionLabel(current) : '暂无可用模型')}</span>
+        <span class="model-dropdown-caret" aria-hidden="true"></span>
+      </button>
+      <div class="model-dropdown-menu ${wasOpen ? '' : 'hidden'}" role="listbox">
+        ${state.providers.map((p) => `
+          <button class="model-dropdown-option ${p.id === state.currentProviderId ? 'active' : ''}" role="option" aria-selected="${p.id === state.currentProviderId ? 'true' : 'false'}" data-provider-id="${p.id}" type="button">${escapeHtml(providerOptionLabel(p))}</button>`).join('')}
+      </div>`;
+    const trigger = container.querySelector('.model-dropdown-trigger');
+    trigger?.addEventListener('click', () => toggleModelDropdown(container));
+    trigger?.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') closeModelDropdowns();
+    });
+    container.querySelectorAll('[data-provider-id]').forEach((button) => {
+      button.addEventListener('click', () => {
+        state.currentProviderId = Number(button.dataset.providerId) || null;
+        closeModelDropdowns();
+        renderProviderSelect();
+      });
+      button.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          closeModelDropdowns();
+          container.querySelector('.model-dropdown-trigger')?.focus();
+        }
+      });
+    });
+  }
+}
+
+function providerOptionLabel(provider) {
+  const cost = Number(provider.creditCost || 1);
+  return `${provider.name}${cost > 1 ? ` · ${cost}点/次` : ''}`;
+}
+
+function loadStoredChatMode() {
+  try {
+    const mode = localStorage.getItem(CHAT_MODE_KEY);
+    return mode === 'agent' ? 'agent' : 'qa';
+  } catch {
+    return 'qa';
+  }
+}
+
+function setChatMode(mode, options = {}) {
+  const nextMode = mode === 'agent' ? 'agent' : 'qa';
+  const changed = state.chatMode !== nextMode;
+  state.chatMode = nextMode;
+  try {
+    localStorage.setItem(CHAT_MODE_KEY, state.chatMode);
+  } catch {}
+  renderChatModeState();
+  if (changed && !(state.currentMessages || []).length) {
+    const box = el('#messages');
+    if (box) box.innerHTML = renderEmptyState();
+  }
+  if (changed && state.chatMode === 'agent' && options.userInitiated && !hasSeenAgentTutorial()) {
+    openAgentTutorial({ focus: true });
+  }
+}
+
+function toggleChatMode() {
+  setChatMode(state.chatMode === 'agent' ? 'qa' : 'agent', { userInitiated: true });
+}
+
+function chatModeLabel() {
+  return state.chatMode === 'agent' ? 'Agent 解题' : '普通问答';
+}
+
+function chatModeKicker() {
+  return state.chatMode === 'agent' ? 'Agent 解题工作台' : '普通问答模式';
+}
+
+function chatModeHint() {
+  return state.chatMode === 'agent'
+    ? 'Agent 解题：启用人设路由和工具复核，适合复杂题。'
+    : '普通问答：不调用工具，响应更直接。';
+}
+
+function renderChatModeButton() {
+  const button = el('#chatModeBtn');
+  if (button) {
+    button.textContent = chatModeLabel();
+    button.title = chatModeHint();
+    button.classList.toggle('active', state.chatMode === 'agent');
+    button.setAttribute('aria-pressed', state.chatMode === 'agent' ? 'true' : 'false');
+  }
+}
+
+function renderChatModeState() {
+  const isAgent = state.chatMode === 'agent';
+  el('#app')?.classList.toggle('mode-agent', isAgent);
+  el('#app')?.classList.toggle('mode-qa', !isAgent);
+  document.querySelectorAll('.layout, .main').forEach((node) => {
+    node.classList.toggle('mode-agent', isAgent);
+    node.classList.toggle('mode-qa', !isAgent);
+  });
+  document.querySelectorAll('[data-chat-mode-choice]').forEach((button) => {
+    const active = button.dataset.chatModeChoice === state.chatMode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  const guide = el('#agentGuideStrip');
+  if (guide) guide.classList.toggle('hidden', !isAgent);
+  const kicker = el('#chatModeKicker');
+  if (kicker) kicker.textContent = chatModeKicker();
+  renderChatModeButton();
+}
+
+function hasSeenAgentTutorial() {
+  try {
+    return localStorage.getItem(AGENT_TUTORIAL_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function markAgentTutorialSeen() {
+  try {
+    localStorage.setItem(AGENT_TUTORIAL_KEY, '1');
+  } catch {}
+}
+
+function openAgentTutorial(options = {}) {
+  state.agentTutorialOpen = true;
+  const modal = el('#agentTutorial');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+  const video = el('#agentTutorialVideo');
+  if (video) video.play().catch(() => {});
+  if (options.focus) {
+    requestAnimationFrame(() => el('#agentTutorialDone')?.focus());
+  }
+}
+
+function closeAgentTutorial(options = {}) {
+  state.agentTutorialOpen = false;
+  if (options.markSeen) markAgentTutorialSeen();
+  const video = el('#agentTutorialVideo');
+  if (video && !video.paused) video.pause();
+  el('#agentTutorial')?.classList.add('hidden');
+}
+
+function updateQuota(quota) {
+  if (!quota) return;
+  state.quota = quota;
+  updateQuotaUi();
+}
+
+function updateZhentiAccess(zhentiAccess) {
+  if (zhentiAccess) state.zhentiAccess = zhentiAccess;
+  const link = el('#zhentiAccessLink');
+  const card = el('#zhentiAccessCard');
+  if (!link || !card) return;
+  card.classList.toggle('expired', !state.zhentiAccess?.allowed);
+  const title = link.querySelector('span');
+  const detail = link.querySelector('small');
+  if (title) title.textContent = renderZhentiAccessTitle();
+  if (detail) detail.textContent = renderZhentiAccessDetail();
+}
+
+function updateQuotaUi() {
+  const text = renderQuotaText();
+  for (const node of [el('#quotaMeter'), el('#quotaInline')]) {
+    if (!node) continue;
+    node.textContent = text;
+    node.classList.toggle('quota-empty', isQuestionQuotaExhausted());
+    node.classList.toggle('hidden', !text);
+  }
+  updateSendButtonState();
+}
+
+function renderZhentiAccessTitle() {
+  const access = state.zhentiAccess || state.student?.zhentiAccess;
+  if (!access) return '考研真题';
+  if (access.status === 'paid') return '考研真题已开通';
+  if (access.status === 'trial') return '考研真题试用中';
+  if (access.status === 'trial_available') return '考研真题可试用';
+  return '考研真题待开通';
+}
+
+function renderZhentiAccessDetail() {
+  const access = state.zhentiAccess || state.student?.zhentiAccess;
+  if (!access) return '登录后查看访问状态';
+  if (access.status === 'paid') return `到 ${formatDateOnly(access.paidUntil || access.accessEndAt)}`;
+  if (access.status === 'trial') return `剩余约 ${Number(access.remainingDays || 0)} 天`;
+  if (access.status === 'trial_available') return `进入后开启 ${Number(access.trialDays || 14)} 天`;
+  return `兑换码开通到 ${formatDateOnly(access.accessEndAt)}`;
+}
+
+function renderQuotaText() {
+  const quota = state.quota;
+  if (!quota) return '';
+  const remaining = Math.max(0, Number(quota.remaining || 0));
+  const limit = Math.max(0, Number(quota.limit || 0));
+  if (quota.plan && quota.plan !== 'free') {
+    const expiry = quota.membershipExpiresAt ? ` · 到期 ${formatDateOnly(quota.membershipExpiresAt)}` : '';
+    return `${quota.planLabel || quota.plan} 剩余 ${remaining}/${limit} 点${expiry}`;
+  }
+  return `今日剩余 ${remaining}/${limit}`;
+}
+
+function isQuestionQuotaExhausted() {
+  const quota = state.quota;
+  return Boolean(quota && quota.limit !== null && quota.limit !== undefined && Number(quota.remaining || 0) <= 0);
+}
+
+function updateSendButtonState() {
+  const sendButton = el('#sendBtn');
+  if (sendButton) sendButton.disabled = state.sending || isQuestionQuotaExhausted();
+}
+
+function describeRedeemGrant(data) {
+  const plan = data.plan || {};
+  if (plan.type === 'zhenti') return '数学 / 英语真题已开通。';
+  if (plan.type === 'tongji') return '432 统计真题已开通。';
+  const label = plan.label || state.student?.planLabel || '会员';
+  const credits = Number(plan.credits || 0);
+  const q = data.quota || state.quota || {};
+  const expiry = q.membershipExpiresAt ? `，到期 ${formatDateOnly(q.membershipExpiresAt)}` : '';
+  return `${label} 已生效${credits ? `，+${credits} 点` : ''}${expiry}。`;
+}
+
+async function redeemMembershipCode(event) {
+  event.preventDefault();
+  const input = el('#redeemCodeInput');
+  const code = String(input?.value || '').trim();
+  if (!code) {
+    setTransientStatus('请输入兑换码。', true);
+    return;
+  }
+  try {
+    const data = await api('/redeem', { method: 'POST', body: { code } });
+    state.student = data.student || state.student;
+    state.invite = data.invite || state.invite;
+    if (data.tongjiAccess) state.tongjiAccess = data.tongjiAccess;
+    updateQuota(data.quota);
+    updateZhentiAccess(data.zhentiAccess || data.student?.zhentiAccess);
+    if (input) input.value = '';
+    await loadProviders();
+    renderProviderSelect();
+    // 刷新权益 / 兑换记录，供「我的账户」看板显示
+    try {
+      const me = await api('/me');
+      state.redemptions = me.redemptions || state.redemptions;
+      state.invite = me.invite || state.invite;
+      state.tongjiAccess = me.tongjiAccess || state.tongjiAccess;
+      if (state.accountOpen) { const body = el('#accountModalBody'); if (body) body.innerHTML = renderAccountBody(); }
+    } catch {}
+    setTransientStatus(`兑换成功：${describeRedeemGrant(data)}`);
+  } catch (err) {
+    setTransientStatus(`兑换失败：${err.message}`, true, 4200);
   }
 }
 
@@ -1475,17 +2824,13 @@ function renderMessages(messages) {
   if (!box) return Promise.resolve();
   closeSelectionToolbar();
   state.currentMessages = Array.isArray(messages) ? messages.map((message) => ({ ...message })) : [];
+  renderChatModeState();
   updateTopbarActions();
   messageContents.clear();
   localRetrySources.clear();
   if (!messages.length) {
     el('.main')?.classList.add('chat-empty');
-    box.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-brand-mark">研</div>
-        <h2>今天想攻克哪道题？</h2>
-        <p>把卡住的那一步放进来，我们慢慢拆。</p>
-      </div>`;
+    box.innerHTML = renderEmptyState();
     renderMessageOutline();
     applyConversationFind();
     return Promise.resolve();
@@ -1504,6 +2849,34 @@ function renderMessages(messages) {
   });
 }
 
+function renderEmptyState() {
+  if (state.chatMode === 'agent') {
+    return `
+      <div class="empty-state agent-empty-state">
+        <div class="empty-brand-mark">研</div>
+        <h2>Agent 解题工作台</h2>
+        <p>适合把复杂题、图片题、算法题和需要验算的推导一次性拆清楚。</p>
+        <div class="empty-mode-notes" aria-label="Agent 模式能力">
+          <span>人设路由</span>
+          <span>规划解题</span>
+          <span>公式验算</span>
+          <span>知识库检索</span>
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="empty-state">
+      <div class="empty-brand-mark">研</div>
+      <h2>今天想攻克哪道题？</h2>
+      <p>普通问答适合快速提问；复杂推导可以切到 Agent 解题。不清楚怎么用点上方「使用教程」。</p>
+      <div class="empty-mode-notes" aria-label="普通问答特点">
+        <span>直接回答</span>
+        <span>响应最快</span>
+        <span>不调用工具</span>
+      </div>
+    </div>`;
+}
+
 function renderMessage(message) {
   const roleName = message.role === 'user' ? '学生' : '助手';
   const attachments = message.attachments || [];
@@ -1512,6 +2885,7 @@ function renderMessage(message) {
     ? `<div class="message-images">${attachments.map((a) => renderImageThumb(a)).join('')}</div>`
     : '';
   const metaHtml = renderMessageMeta(message);
+  const traceHtml = renderPersistedAgentTrace(message);
   const sectionNavHtml = renderAnswerSectionNav(message);
   const followUpHtml = renderFollowUpSuggestions(message);
   const quickActionsHtml = renderMessageQuickActions(message);
@@ -1522,6 +2896,7 @@ function renderMessage(message) {
       <div class="message-card">
         ${quickActionsHtml}
         ${sectionNavHtml}
+        ${traceHtml}
         <div class="message-content">${renderMarkdown(message.content || '')}</div>
         ${imageHtml}
         ${metaHtml}
@@ -1529,6 +2904,18 @@ function renderMessage(message) {
         ${actionsHtml}
       </div>
     </article>`;
+}
+
+function renderPersistedAgentTrace(message) {
+  const traces = Array.isArray(message?.traces) ? message.traces : [];
+  if (message?.role !== 'assistant' || !traces.length) return '';
+  return `<div class="agent-trace visible" aria-label="Agent 执行记录">
+    ${traces.map((trace) => {
+      const item = formatAgentTrace(trace);
+      if (!item) return '';
+      return `<span class="agent-trace-item ${escapeAttr(item.className || '')}">${escapeHtml(item.text)}</span>`;
+    }).join('')}
+  </div>`;
 }
 
 function renderFollowUpSuggestions(message) {
@@ -1651,6 +3038,7 @@ async function sendMessage() {
           <span class="think-badge">Think</span>
           <span class="think-text">深度思考中 · 0s</span>
         </div>
+        <div class="agent-trace" id="${assistantId}_trace" aria-label="Agent 执行记录"></div>
         ${renderMessageQuickActions({ id: assistantId, role: 'assistant' }, { retryDisabled: true, continueDisabled: true })}
         <div class="message-content streaming" id="${assistantId}_content"></div>
         ${renderMessageActions({ id: assistantId, role: 'assistant' }, { exportDisabled: true, retryDisabled: true })}
@@ -1688,6 +3076,7 @@ async function sendMessage() {
       body: JSON.stringify({
         conversationId: state.currentConversationId,
         providerId: state.currentProviderId,
+        chatMode: state.chatMode,
         message: text,
         attachments
       })
@@ -1702,14 +3091,18 @@ async function sendMessage() {
           retrySource.conversationId = data.conversationId || state.currentConversationId;
           if (data.userMessageId) retrySource.userMessageId = data.userMessageId;
         }
-        if (data.userMessageId) {
-          promoteRenderedMessage(userMessage.id, {
-            id: data.userMessageId,
+          if (data.userMessageId) {
+            promoteRenderedMessage(userMessage.id, {
+              id: data.userMessageId,
             role: 'user',
             content: text,
-            attachments: pendingAttachments
-          });
-        }
+              attachments: pendingAttachments
+            });
+          }
+          if (data.quota) updateQuota(data.quota);
+        },
+      trace(data) {
+        appendAgentTrace(assistantId, data);
       },
       delta(data) {
         assistantRaw += data.text || '';
@@ -1730,8 +3123,9 @@ async function sendMessage() {
         if (target) scheduleStreamingRender(target, assistantRaw);
       },
       async done(data) {
-        completed = true;
-        clearInterval(thinkTimer);
+          completed = true;
+          if (data?.quota) updateQuota(data.quota);
+          clearInterval(thinkTimer);
         finishThinkLine(thinkEl, thinkStartedAt);
         const target = el(`#${assistantId}_content`);
         if (target) {
@@ -1764,9 +3158,10 @@ async function sendMessage() {
     const target = el(`#${assistantId}_content`);
     const stopped = isAbortError(err);
     if (target) {
+      target.classList.remove('streaming');
       const fallback = stopped
         ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
-        : `发送失败：${err.message}`;
+        : `发送失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
       enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()), allowLocalRetry: true });
     }
@@ -1816,6 +3211,7 @@ async function retryMessage(messageId) {
           <span class="think-badge">Think</span>
           <span class="think-text">重新生成中 · 0s</span>
         </div>
+        <div class="agent-trace" id="${assistantId}_trace" aria-label="Agent 执行记录"></div>
         ${renderMessageQuickActions({ id: assistantId, role: 'assistant' }, { retryDisabled: true, continueDisabled: true })}
         <div class="message-content streaming" id="${assistantId}_content"></div>
         ${renderMessageActions({ id: assistantId, role: 'assistant' }, { exportDisabled: true, retryDisabled: true })}
@@ -1848,6 +3244,7 @@ async function retryMessage(messageId) {
       body: JSON.stringify({
         conversationId: state.currentConversationId,
         providerId: state.currentProviderId,
+        chatMode: state.chatMode,
         ...(retryMessageId ? { messageId: retryMessageId } : {}),
         ...(retryUserMessageId ? { userMessageId: retryUserMessageId } : {})
       })
@@ -1863,6 +3260,9 @@ async function retryMessage(messageId) {
           if (data.userMessageId) nextRetrySource.userMessageId = data.userMessageId;
         }
       },
+      trace(data) {
+        appendAgentTrace(assistantId, data);
+      },
       delta(data) {
         assistantRaw += data.text || '';
         messageContents.set(assistantId, assistantRaw);
@@ -1877,9 +3277,10 @@ async function retryMessage(messageId) {
         const target = el(`#${assistantId}_content`);
         if (target) scheduleStreamingRender(target, assistantRaw);
       },
-      async done(data) {
-        completed = true;
-        clearInterval(thinkTimer);
+        async done(data) {
+          completed = true;
+          if (data?.quota) updateQuota(data.quota);
+          clearInterval(thinkTimer);
         finishThinkLine(thinkEl, thinkStartedAt);
         const target = el(`#${assistantId}_content`);
         if (target) {
@@ -1912,9 +3313,10 @@ async function retryMessage(messageId) {
     const target = el(`#${assistantId}_content`);
     const stopped = isAbortError(err);
     if (target) {
+      target.classList.remove('streaming');
       const fallback = stopped
         ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
-        : `重新生成失败：${err.message}`;
+        : `重新生成失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
       enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()), allowLocalRetry: true });
     }
@@ -1963,6 +3365,7 @@ async function continueMessage(messageId) {
           <span class="think-badge">Think</span>
           <span class="think-text">继续回答中 · 0s</span>
         </div>
+        <div class="agent-trace" id="${assistantId}_trace" aria-label="Agent 执行记录"></div>
         ${renderMessageQuickActions({ id: assistantId, role: 'assistant' }, { retryDisabled: true, continueDisabled: true })}
         <div class="message-content streaming" id="${assistantId}_content"></div>
         ${renderMessageActions({ id: assistantId, role: 'assistant' }, { exportDisabled: true, retryDisabled: true, continueDisabled: true })}
@@ -1995,6 +3398,7 @@ async function continueMessage(messageId) {
       body: JSON.stringify({
         conversationId: state.currentConversationId,
         providerId: state.currentProviderId,
+        chatMode: state.chatMode,
         messageId
       })
     });
@@ -2002,6 +3406,9 @@ async function continueMessage(messageId) {
     await readSse(response, {
       meta(data) {
         if (data.conversationId) state.currentConversationId = data.conversationId;
+      },
+      trace(data) {
+        appendAgentTrace(assistantId, data);
       },
       delta(data) {
         assistantRaw += data.text || '';
@@ -2017,9 +3424,10 @@ async function continueMessage(messageId) {
         const target = el(`#${assistantId}_content`);
         if (target) scheduleStreamingRender(target, assistantRaw);
       },
-      async done(data) {
-        completed = true;
-        clearInterval(thinkTimer);
+        async done(data) {
+          completed = true;
+          if (data?.quota) updateQuota(data.quota);
+          clearInterval(thinkTimer);
         finishThinkLine(thinkEl, thinkStartedAt);
         const target = el(`#${assistantId}_content`);
         if (target) {
@@ -2050,9 +3458,10 @@ async function continueMessage(messageId) {
     const target = el(`#${assistantId}_content`);
     const stopped = isAbortError(err);
     if (target) {
+      target.classList.remove('streaming');
       const fallback = stopped
         ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
-        : `继续回答失败：${err.message}`;
+        : `继续回答失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
       enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()) });
     }
@@ -2153,6 +3562,7 @@ async function editAndResendMessage(messageId, text, article) {
           <span class="think-badge">Think</span>
           <span class="think-text">修改后重答中 · 0s</span>
         </div>
+        <div class="agent-trace" id="${assistantId}_trace" aria-label="Agent 执行记录"></div>
         ${renderMessageQuickActions({ id: assistantId, role: 'assistant' }, { retryDisabled: true, continueDisabled: true })}
         <div class="message-content streaming" id="${assistantId}_content"></div>
         ${renderMessageActions({ id: assistantId, role: 'assistant' }, { exportDisabled: true, retryDisabled: true })}
@@ -2179,6 +3589,7 @@ async function editAndResendMessage(messageId, text, article) {
       body: JSON.stringify({
         conversationId: state.currentConversationId,
         providerId: state.currentProviderId,
+        chatMode: state.chatMode,
         messageId,
         message: text
       })
@@ -2196,6 +3607,9 @@ async function editAndResendMessage(messageId, text, article) {
           });
         }
       },
+      trace(data) {
+        appendAgentTrace(assistantId, data);
+      },
       delta(data) {
         assistantRaw += data.text || '';
         messageContents.set(assistantId, assistantRaw);
@@ -2210,9 +3624,10 @@ async function editAndResendMessage(messageId, text, article) {
         const target = el(`#${assistantId}_content`);
         if (target) scheduleStreamingRender(target, assistantRaw);
       },
-      async done(data) {
-        completed = true;
-        clearInterval(thinkTimer);
+        async done(data) {
+          completed = true;
+          if (data?.quota) updateQuota(data.quota);
+          clearInterval(thinkTimer);
         finishThinkLine(thinkEl, thinkStartedAt);
         const target = el(`#${assistantId}_content`);
         if (target) {
@@ -2241,9 +3656,10 @@ async function editAndResendMessage(messageId, text, article) {
     const target = el(`#${assistantId}_content`);
     const stopped = isAbortError(err);
     if (target) {
+      target.classList.remove('streaming');
       const fallback = stopped
         ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
-        : `修改并重问失败：${err.message}`;
+        : `修改并重问失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
       enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()) });
     }
@@ -2588,6 +4004,12 @@ async function handleMessageActionClick(event) {
   const savedButton = event.target.closest('[data-save-message]');
   if (savedButton && !savedButton.disabled) {
     await setMessageSaved(savedButton.dataset.saveMessage || '', savedButton);
+    return;
+  }
+
+  const addReviewButton = event.target.closest('[data-add-review]');
+  if (addReviewButton && !addReviewButton.disabled) {
+    await addMessageToReview(addReviewButton.dataset.addReview || '', addReviewButton);
     return;
   }
 
@@ -3104,6 +4526,11 @@ function handleGlobalKeydown(event) {
     closeCommandPalette();
     return;
   }
+  if (event.key === 'Escape' && !el('#agentTutorial')?.classList.contains('hidden')) {
+    event.preventDefault();
+    closeAgentTutorial({ markSeen: true });
+    return;
+  }
   if (event.key === 'Escape' && !el('#imagePreview')?.classList.contains('hidden')) {
     event.preventDefault();
     closeImagePreview();
@@ -3112,6 +4539,16 @@ function handleGlobalKeydown(event) {
   if (event.key === 'Escape' && state.selectionToolbar.open) {
     event.preventDefault();
     closeSelectionToolbar({ clearSelection: true });
+    return;
+  }
+  if (event.key === 'Escape' && state.accountOpen) {
+    event.preventDefault();
+    closeAccountModal();
+    return;
+  }
+  if (event.key === 'Escape' && state.mobileSidebarOpen) {
+    event.preventDefault();
+    closeMobileSidebar();
     return;
   }
   if (event.key === 'Escape' && state.sending) {
@@ -3195,10 +4632,10 @@ function startSending(statusText) {
   state.sending = true;
   state.abortController = new AbortController();
   updateTopbarActions();
-  const sendButton = el('#sendBtn');
-  const stopButton = el('#stopBtn');
-  if (sendButton) sendButton.disabled = true;
-  if (stopButton) {
+    const sendButton = el('#sendBtn');
+    const stopButton = el('#stopBtn');
+    updateSendButtonState();
+    if (stopButton) {
     stopButton.disabled = false;
     stopButton.classList.remove('hidden');
   }
@@ -3210,9 +4647,9 @@ function finishSending() {
   state.sending = false;
   state.abortController = null;
   updateTopbarActions();
-  const sendButton = el('#sendBtn');
-  const stopButton = el('#stopBtn');
-  if (sendButton) sendButton.disabled = false;
+    const sendButton = el('#sendBtn');
+    const stopButton = el('#stopBtn');
+    updateSendButtonState();
   if (stopButton) {
     stopButton.disabled = true;
     stopButton.classList.add('hidden');
@@ -3223,6 +4660,15 @@ function finishSending() {
 
 function stopGeneration() {
   if (!state.abortController || state.abortController.signal.aborted) return;
+  // 服务端生成已与连接解耦：必须显式通知服务端中止，否则仅断开本地连接，后台会继续跑。
+  if (state.currentConversationId) {
+    fetch(`${API}/chat/stop`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversationId: state.currentConversationId })
+    }).catch(() => {});
+  }
   state.abortController.abort();
   const stopButton = el('#stopBtn');
   if (stopButton) stopButton.disabled = true;
@@ -3275,6 +4721,15 @@ function isAbortError(err) {
   return err?.name === 'AbortError' || String(err?.message || '').includes('aborted');
 }
 
+function streamFailureMessage(err) {
+  const text = String(err?.message || '').trim();
+  if (!text) return '连接中断，请点击重新生成。';
+  if (/network\s*error|failed to fetch|load failed|connection|network/i.test(text)) {
+    return '连接中断，请点击重新生成。';
+  }
+  return text;
+}
+
 function renderMessageActions(message, options = {}) {
   const messageId = message?.id || '';
   const id = escapeAttr(messageId);
@@ -3314,13 +4769,14 @@ function renderMessageActions(message, options = {}) {
     <button class="message-action" data-export-message="${id}" data-export-format="md" type="button" ${exportDisabled ? 'disabled' : ''}>MD</button>
     <button class="message-action" data-export-message="${id}" data-export-format="pdf" type="button" ${exportDisabled ? 'disabled' : ''}>PDF</button>
     <button class="message-action" data-export-message="${id}" data-export-format="json" type="button" ${exportDisabled ? 'disabled' : ''}>JSON</button>
-    ${retryButton}
+    ${message?.role === 'assistant' ? `<button class="message-action" data-add-review="${id}" type="button" ${exportDisabled ? 'disabled' : ''}>加入复习</button>` : ''}
     ${continueButton}
     ${feedbackButtons}`;
   return `<div class="message-actions">
     <button class="message-action" data-copy-message="${id}" type="button">复制</button>
     <button class="message-action" data-quote-message="${id}" type="button" ${quoteDisabled ? 'disabled' : ''}>追问</button>
     <button class="message-action saved ${saved ? 'active' : ''}" data-save-message="${id}" type="button" aria-pressed="${saved ? 'true' : 'false'}" ${quoteDisabled ? 'disabled' : ''}>${saved ? '已收藏' : '收藏'}</button>
+    ${retryButton}
     ${collapseButton}
     ${editButton}
     <details class="message-more">
@@ -3553,7 +5009,7 @@ async function exportAllConversations(format) {
       if (status) status.textContent = '还没有可导出的答疑记录。';
       return;
     }
-    const title = `${data.student?.studentNo || '学生'}-全部答疑记录`;
+    const title = `${studentLabel(data.student)}-全部答疑记录`;
     if (format === 'md') {
       downloadTextFile(`${safeFilename(title)}.md`, buildAllConversationsMarkdown(title, records), 'text/markdown;charset=utf-8');
       showToast('全部会话 MD 已导出。');
@@ -3590,7 +5046,7 @@ async function exportSavedMessages(format) {
       if (status) status.textContent = '还没有收藏的消息。';
       return;
     }
-    const title = `${data.student?.studentNo || '学生'}-复习收藏`;
+    const title = `${studentLabel(data.student)}-复习收藏`;
     if (format === 'md') {
       downloadTextFile(`${safeFilename(title)}.md`, buildAllConversationsMarkdown(title, records), 'text/markdown;charset=utf-8');
       showToast('复习收藏 MD 已导出。');
@@ -3618,7 +5074,7 @@ async function exportSavedMessages(format) {
 }
 
 function exportStudyMemory(format) {
-  const studentNo = state.student?.studentNo || '学生';
+  const studentNo = studentLabel(state.student);
   const title = `${studentNo}-学习记忆`;
   if (format === 'json') {
     downloadJsonFile(`${safeFilename(title)}.json`, buildStudyMemoryJsonPayload());
@@ -3634,17 +5090,19 @@ function buildStudyMemoryJsonPayload() {
     format: 'kaoyan-chat.study-memory.v1',
     exportedAt: new Date().toISOString(),
     student: {
+      email: state.student?.email || '',
       studentNo: state.student?.studentNo || '',
       displayName: state.student?.displayName || ''
     },
-    memory: normalizedStudyMemory()
+    memory: normalizedStudyMemory(),
+    topicMastery: state.studyMemory.topicMastery || null
   };
 }
 
 function buildStudyMemoryMarkdown() {
   const memory = normalizedStudyMemory();
   const lines = [
-    `# ${state.student?.studentNo || '学生'} 学习记忆`,
+    `# ${studentLabel(state.student)} 学习记忆`,
     '',
     `导出时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
     `更新时间：${memory.lastUpdatedAt ? formatTime(memory.lastUpdatedAt) : '尚未更新'}`,
@@ -3657,12 +5115,32 @@ function buildStudyMemoryMarkdown() {
   } else {
     lines.push('- 暂无画像信息');
   }
+  if (memory.summary) {
+    lines.push('', '## 画像总结', memory.summary);
+  }
+  lines.push('', '## 薄弱点');
+  if (memory.weakPoints.length) {
+    for (const item of memory.weakPoints) {
+      lines.push(`- ${String(item?.point || '')}（${Number(item?.count) || 1}次）${item?.evidence ? `：${String(item.evidence)}` : ''}`);
+    }
+  } else {
+    lines.push('- 暂无薄弱点记录');
+  }
   lines.push('', '## 高频主题');
   const topics = studyMemoryTopicEntries(memory);
   if (topics.length) {
     for (const [topic, count] of topics) lines.push(`- ${topic}：${Number(count) || 0}`);
   } else {
     lines.push('- 暂无主题记录');
+  }
+  const redTopics = state.studyMemory.topicMastery?.redTopics || [];
+  lines.push('', '## 红区考点');
+  if (redTopics.length) {
+    for (const topic of redTopics.slice(0, 8)) {
+      lines.push(`- ${topic.path || topic.label}：掌握度 ${topic.score ?? 0}，薄弱 ${topic.weak || 0} 次`);
+    }
+  } else {
+    lines.push('- 当前没有明显红区考点');
   }
   lines.push('', '## 最近问题');
   const recentQuestions = Array.isArray(memory.recentQuestions) ? memory.recentQuestions.slice(-20) : [];
@@ -3680,6 +5158,8 @@ function normalizedStudyMemory() {
     profile: memory.profile && typeof memory.profile === 'object' ? memory.profile : {},
     topics: memory.topics && typeof memory.topics === 'object' ? memory.topics : {},
     recentQuestions: Array.isArray(memory.recentQuestions) ? memory.recentQuestions : [],
+    weakPoints: Array.isArray(memory.weakPoints) ? memory.weakPoints : [],
+    summary: typeof memory.summary === 'string' ? memory.summary : '',
     lastUpdatedAt: memory.lastUpdatedAt || null
   };
 }
@@ -3848,9 +5328,14 @@ function sanitizeExportMessages(messages) {
 
 function exportStudentInfo() {
   return {
+    email: state.student?.email || '',
     studentNo: state.student?.studentNo || '',
-    displayName: state.student?.displayName || state.student?.studentNo || ''
+    displayName: state.student?.displayName || studentLabel(state.student)
   };
+}
+
+function studentLabel(student = state.student) {
+  return student?.email || student?.displayName || student?.studentNo || '学生';
 }
 
 function messageForExport(messageId, article) {
@@ -4406,6 +5891,19 @@ function renderAdminShell() {
       <aside class="admin-nav">
         <h1>考研答疑后台</h1>
         <p class="status">配置模型、查看学生和旧知识库导入情况。</p>
+        <nav class="admin-menu">
+          <a href="#adminStats">数据总览</a>
+          <a href="#panel-activity">最近提问</a>
+          <a href="#panel-feedback">回复反馈</a>
+          <a href="#panel-providers">Provider 配置</a>
+          <a href="#panel-agent-profiles">Agent 人设</a>
+          <a href="#panel-agent-routes">路由日志</a>
+          <a href="#panel-redemptions">会员兑换码</a>
+          <a href="#panel-invite-rewards">邀请奖励</a>
+          <a href="#panel-provider-form">新增 Provider</a>
+          <a href="#panel-students">学生概览</a>
+          <a href="#panel-prompt">提示词预览</a>
+        </nav>
         <div class="sidebar-footer">
           <a class="btn ghost" href="${BASE}/">学生端</a>
           <button class="btn ghost" id="adminLogoutBtn" type="button">退出</button>
@@ -4414,15 +5912,82 @@ function renderAdminShell() {
       <main class="admin-content">
         <div id="adminStatus" class="status"></div>
         <section class="admin-grid" id="adminStats"></section>
-        <section class="panel">
+        <section class="panel admin-duo" id="panel-activity">
+          <div class="admin-duo-col">
+            <h2>最近提问</h2>
+            <div id="recentQuestionList"></div>
+          </div>
+          <div class="admin-duo-col">
+            <h2>近 7 天模型用量</h2>
+            <div id="modelUsageList"></div>
+          </div>
+        </section>
+        <section class="panel" id="panel-feedback">
           <h2>回复反馈</h2>
           <div id="feedbackList"></div>
         </section>
-        <section class="panel">
+        <section class="panel" id="panel-providers">
           <h2>Provider 配置</h2>
           <div id="providerList"></div>
         </section>
-        <section class="panel">
+        <section class="panel" id="panel-agent-profiles">
+          <h2>Agent 人设</h2>
+          <form id="agentProfilesForm">
+            <div id="agentProfileList"></div>
+            <div class="agent-profile-actions">
+              <button class="btn primary" type="submit">保存人设</button>
+              <button class="btn" id="resetAgentProfilesBtn" type="button">恢复默认</button>
+            </div>
+          </form>
+        </section>
+        <section class="panel" id="panel-agent-routes">
+          <h2>路由日志</h2>
+          <div id="agentRouteLogList"></div>
+        </section>
+        <section class="panel" id="panel-redemptions">
+          <h2>兑换码</h2>
+          <form class="provider-form" id="redemptionForm">
+            <div class="form-field">
+              <label>套餐</label>
+              <select class="input" id="redemptionPlan">
+                <option value="se">SE · 700点</option>
+                <option value="plus">Plus · 1000点</option>
+                <option value="zhenti">数学/英语真题 · 到 12.22</option>
+                <option value="tongji">432 统计真题 · 到 12.22</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label>数量</label>
+              <input class="input" id="redemptionCount" type="number" min="1" max="100" value="1" />
+            </div>
+            <div class="form-field">
+              <label>有效期(天，0=永久)</label>
+              <input class="input" id="redemptionExpires" type="number" min="0" max="3650" value="0" />
+            </div>
+            <div class="form-field">
+              <label>批次</label>
+              <input class="input" id="redemptionBatch" placeholder="可选，如 2026春-小红书" />
+            </div>
+            <div class="form-field wide">
+              <label>备注</label>
+              <input class="input" id="redemptionNote" placeholder="可选，例如付款截图编号" />
+            </div>
+            <div class="wide">
+              <button class="btn primary" type="submit">生成兑换码</button>
+            </div>
+          </form>
+          <div class="redemption-toolbar">
+            <input class="input redemption-filter" id="redemptionFilter" placeholder="筛选：兑换码 / 批次 / 状态(unused/redeemed/void)" />
+            <button class="btn" id="redemptionExportBtn" type="button">导出 CSV</button>
+          </div>
+          <div id="redemptionList"></div>
+        </section>
+        <section class="panel" id="panel-invite-rewards">
+          <h2>邀请奖励</h2>
+          <p class="status">好友兑换考研真题成功后，邀请人可获得邀请奖励，联系负责人领取。</p>
+          <div id="inviteRewardList"></div>
+        </section>
+        <section class="panel" id="panel-provider-form">
           <h2 id="providerFormTitle">新增 Provider</h2>
           <form class="provider-form" id="providerForm">
             <input type="hidden" id="providerId" />
@@ -4455,7 +6020,29 @@ function renderAdminShell() {
             </div>
             <div class="form-field">
               <label>最大输出 token</label>
-              <input class="input" id="providerMaxTokens" type="number" min="256" max="64000" step="256" value="4096" />
+              <input class="input" id="providerMaxTokens" type="number" min="0" max="64000" step="256" value="4096" />
+            </div>
+            <div class="form-field">
+              <label>推理强度</label>
+              <select class="input" id="providerReasoningEffort">
+                <option value="">自动</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="max">max</option>
+                <option value="xhigh">xhigh</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label>扣费类型</label>
+              <select class="input" id="providerModelKey">
+                <option value="">自动识别</option>
+                <option value="gpt55">GPT-5.5 · 1点</option>
+                <option value="gemini">Gemini · 3点</option>
+                <option value="opus">Opus · 5点</option>
+                <option value="other">其他 · 1点</option>
+              </select>
             </div>
             <div class="form-field">
               <label>状态</label>
@@ -4470,14 +6057,14 @@ function renderAdminShell() {
             </div>
           </form>
         </section>
-        <section class="panel">
+        <section class="panel" id="panel-students">
           <h2>学生概览</h2>
           <div id="studentList"></div>
         </section>
-        <section class="panel">
+        <section class="panel" id="panel-prompt">
           <h2>已注入提示词预览</h2>
           <div class="prompt-preview" id="promptPreview"></div>
-          <button class="btn" id="reindexBtn" type="button">重新导入 /root/kaoyan</button>
+          <button class="btn" id="reindexBtn" type="button">从旧资料重新学习</button>
         </section>
       </main>
     </div>`;
@@ -4486,30 +6073,66 @@ function renderAdminShell() {
     renderAdminLogin();
   });
   el('#providerForm')?.addEventListener('submit', saveProvider);
+  el('#redemptionForm')?.addEventListener('submit', createRedemptionCodes);
+  el('#redemptionFilter')?.addEventListener('input', () => renderRedemptionCodes());
+  el('#redemptionExportBtn')?.addEventListener('click', exportRedemptionCsv);
+  el('#redemptionList')?.addEventListener('click', (event) => {
+    const copyBtn = event.target.closest('[data-copy-code]');
+    if (copyBtn) { navigator.clipboard?.writeText(copyBtn.dataset.copyCode).then(() => setAdminStatus('兑换码已复制。')).catch(() => {}); return; }
+    const voidBtn = event.target.closest('[data-void-code]');
+    if (voidBtn) voidRedemptionCode(voidBtn.dataset.voidCode);
+  });
+  el('#inviteRewardList')?.addEventListener('click', (event) => {
+    const claimBtn = event.target.closest('[data-claim-reward]');
+    if (claimBtn) { claimInviteReward(claimBtn.dataset.claimReward); return; }
+    if (event.target.closest('#inviteExportBtn')) exportInviteRewardsCsv();
+  });
+  el('#agentProfilesForm')?.addEventListener('submit', saveAgentProfiles);
+  el('#resetAgentProfilesBtn')?.addEventListener('click', resetAgentProfilesToDefault);
   el('#resetProviderForm')?.addEventListener('click', resetProviderForm);
   el('#reindexBtn')?.addEventListener('click', reindexKnowledge);
 }
 
 async function loadAdmin() {
-  const [stats, providers, students, feedback] = await Promise.all([
+  const [stats, providers, students, feedback, redemptions, inviteRewards, agentProfiles, agentRouteLogs] = await Promise.all([
     api('/admin/stats'),
     api('/admin/providers'),
     api('/admin/students'),
-    api('/admin/feedback')
+    api('/admin/feedback'),
+    api('/admin/redemption-codes'),
+    api('/admin/invite-rewards'),
+    api('/admin/agent-profiles'),
+    api('/admin/agent-route-logs')
   ]);
   renderStats(stats.stats);
   renderProviders(providers.providers || []);
+  state.adminFreeDailyQuestionLimit = students.freeDailyQuestionLimit || 10;
   renderStudents(students.students || []);
   renderFeedback(feedback.feedback || []);
+  state.membershipPlans = redemptions.plans || {};
+  state.redemptionCodes = redemptions.codes || [];
+  renderRedemptionCodes(state.redemptionCodes);
+  state.inviteRewards = inviteRewards || { rewards: [] };
+  renderInviteRewards(state.inviteRewards);
+  state.agentProfileKeys = agentProfiles.keys || Object.keys(agentProfiles.profiles || {});
+  state.agentProfiles = agentProfiles.profiles || {};
+  state.agentProfileDefaults = agentProfiles.defaults || {};
+  renderAgentProfiles();
+  state.agentRouteLogs = agentRouteLogs.logs || [];
+  renderAgentRouteLogs(state.agentRouteLogs);
 }
 
 function renderStats(stats) {
   el('#adminStats').innerHTML = [
     ['学生', stats.students],
+    ['会员', stats.activeMembers ?? 0],
+    ['今日提问', stats.todayQuestions ?? 0],
+    ['7 天提问', stats.weekQuestions ?? 0],
     ['会话', stats.conversations],
     ['消息', stats.messages],
     ['有用', stats.feedbackUp],
     ['需改', stats.feedbackDown],
+    ['巩固练习', stats.practiceSets ?? 0],
     ['知识片段', stats.knowledgeChunks]
   ].map(([label, value]) => `
     <div class="stat-card">
@@ -4517,6 +6140,34 @@ function renderStats(stats) {
       <div class="stat-label">${label}</div>
     </div>`).join('');
   el('#promptPreview').textContent = stats.promptPreview || '';
+  renderAdminActivity(stats);
+}
+
+function renderAdminActivity(stats) {
+  const recentBox = el('#recentQuestionList');
+  if (recentBox) {
+    const recent = stats.recentQuestions || [];
+    recentBox.innerHTML = recent.length
+      ? recent.map((item) => `
+        <div class="admin-recent-item">
+          <div class="admin-recent-meta">${escapeHtml(String(item.studentNo || ''))} · ${escapeHtml(item.title || '')} · ${escapeHtml(formatTime(item.createdAt))}</div>
+          <div class="admin-recent-text">${escapeHtml(item.snippet || '')}</div>
+        </div>`).join('')
+      : '<div class="status">还没有学生提问。</div>';
+  }
+  const usageBox = el('#modelUsageList');
+  if (usageBox) {
+    const usage = stats.modelUsage || [];
+    const max = Math.max(1, ...usage.map((item) => Number(item.n) || 0));
+    usageBox.innerHTML = usage.length
+      ? usage.map((item) => `
+        <div class="admin-usage-row">
+          <span class="admin-usage-name" title="${escapeAttr(item.name)}">${escapeHtml(item.name)}</span>
+          <span class="admin-usage-bar"><i style="width:${Math.round(((Number(item.n) || 0) / max) * 100)}%"></i></span>
+          <b>${Number(item.n) || 0}</b>
+        </div>`).join('')
+      : '<div class="status">近 7 天暂无模型调用。</div>';
+  }
 }
 
 function renderFeedback(items) {
@@ -4526,7 +6177,7 @@ function renderFeedback(items) {
   }
   el('#feedbackList').innerHTML = `
     <table class="provider-table feedback-table">
-      <thead><tr><th>反馈</th><th>学号 / 会话</th><th>回复摘录</th><th>时间</th></tr></thead>
+      <thead><tr><th>反馈</th><th>账号 / 会话</th><th>回复摘录</th><th>时间</th></tr></thead>
       <tbody>
         ${items.map((item) => `
           <tr>
@@ -4546,15 +6197,17 @@ function renderProviders(providers) {
   }
   el('#providerList').innerHTML = `
     <table class="provider-table">
-      <thead><tr><th>名称</th><th>类型</th><th>模型</th><th>状态</th><th>Key</th><th>操作</th></tr></thead>
+      <thead><tr><th>名称</th><th>类型</th><th>模型</th><th>扣费</th><th>推理</th><th>状态</th><th>Key</th><th>操作</th></tr></thead>
       <tbody>
         ${providers.map((p) => `
           <tr>
-            <td>${escapeHtml(p.name)}${p.is_default ? ' · 默认' : ''}<br><span class="status">${escapeHtml(p.base_url)}</span></td>
+            <td>${escapeHtml(p.name)}${p.is_default ? ' <span class="admin-badge default">默认</span>' : ''}<br><span class="status admin-url">${escapeHtml(p.base_url)}</span></td>
             <td>${escapeHtml(p.type)}</td>
-            <td>${escapeHtml(p.model)}</td>
-            <td>${p.enabled ? '启用' : '禁用'}</td>
-            <td>${escapeHtml(p.api_key_masked || '未设置')}</td>
+            <td><code class="admin-key">${escapeHtml(p.model)}</code></td>
+            <td>${escapeHtml(providerModelKeyLabel(p.model_key))}</td>
+            <td>${escapeHtml(p.reasoning_effort || '自动')}</td>
+            <td><span class="admin-badge ${p.enabled ? 'on' : 'off'}">${p.enabled ? '启用' : '禁用'}</span></td>
+            <td><code class="admin-key">${escapeHtml(p.api_key_masked || '未设置')}</code></td>
             <td>
               <button class="btn" data-edit-provider="${p.id}" type="button">编辑</button>
               <button class="btn" data-test-provider="${p.id}" type="button">测试</button>
@@ -4577,6 +6230,15 @@ function renderProviders(providers) {
   });
 }
 
+function providerModelKeyLabel(key) {
+  return {
+    gpt55: 'GPT-5.5 · 1点',
+    gemini: 'Gemini · 3点',
+    opus: 'Opus · 5点',
+    other: '其他 · 1点'
+  }[String(key || '').toLowerCase()] || '自动';
+}
+
 function renderStudents(students) {
   if (!students.length) {
     el('#studentList').innerHTML = `<div class="status">还没有学生登录。</div>`;
@@ -4584,15 +6246,298 @@ function renderStudents(students) {
   }
   el('#studentList').innerHTML = `
     <table class="student-table">
-      <thead><tr><th>学号</th><th>会话</th><th>消息</th><th>最近活跃</th></tr></thead>
+      <thead><tr><th>邮箱</th><th>套餐</th><th>真题墙</th><th>今日额度</th><th>会话</th><th>消息</th><th>最近活跃</th></tr></thead>
       <tbody>${students.map((s) => `
         <tr>
           <td>${escapeHtml(s.student_no)}</td>
+          <td>${escapeHtml(s.plan || 'free')}</td>
+          <td>${escapeHtml(adminZhentiStatus(s))}</td>
+          <td>${Number(s.quota_used_today || 0)}/${state.adminFreeDailyQuestionLimit || 10}</td>
           <td>${s.conversations}</td>
           <td>${s.messages}</td>
           <td>${formatTime(s.last_seen_at)}</td>
         </tr>`).join('')}</tbody>
     </table>`;
+}
+
+function renderRedemptionCodes(codes) {
+  if (Array.isArray(codes)) state.redemptionCodes = codes;
+  const target = el('#redemptionList');
+  if (!target) return;
+  const all = state.redemptionCodes || [];
+  if (!all.length) {
+    target.innerHTML = `<div class="status">还没有兑换码。</div>`;
+    return;
+  }
+  const q = (el('#redemptionFilter')?.value || '').trim().toLowerCase();
+  const list = q
+    ? all.filter((c) => [c.code, c.batch, c.status, c.plan].join(' ').toLowerCase().includes(q))
+    : all;
+  const statusText = (s) => (s === 'redeemed' ? '已使用' : s === 'void' ? '已作废' : '未使用');
+  target.innerHTML = `
+    <div class="status">共 ${all.length} 个 · 显示 ${list.length} 个</div>
+    <table class="student-table redemption-table">
+      <thead><tr><th>兑换码</th><th>套餐</th><th>批次</th><th>额度</th><th>有效期</th><th>状态</th><th>使用者</th><th>操作</th></tr></thead>
+      <tbody>${list.map((code) => `
+        <tr>
+          <td><code>${escapeHtml(code.code)}</code></td>
+          <td>${escapeHtml(planLabel(code.plan))}</td>
+          <td>${escapeHtml(code.batch || '')}</td>
+          <td>${escapeHtml(redemptionValueText(code))}</td>
+          <td>${code.expires_at ? escapeHtml(formatDateOnly(code.expires_at)) : '永久'}</td>
+          <td><span class="admin-badge ${code.status === 'redeemed' ? 'on' : code.status === 'void' ? 'default' : 'on'}">${statusText(code.status)}</span></td>
+          <td>${escapeHtml(code.redeemed_by || '')}</td>
+          <td class="redemption-ops">
+            <button class="conversation-action" data-copy-code="${escapeAttr(code.code)}" type="button">复制</button>
+            ${code.status === 'unused' ? `<button class="conversation-action danger" data-void-code="${escapeAttr(code.code)}" type="button">作废</button>` : ''}
+          </td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+function exportInviteRewardsCsv() {
+  const rewards = (state.inviteRewards?.rewards || []).filter((r) => r.status === 'pending');
+  if (!rewards.length) { setAdminStatus('暂无待发放奖励。', true); return; }
+  const header = ['inviter', 'invitee', 'redemptionCode', 'amountCents', 'createdAt'];
+  const rows = rewards.map((r) => header.map((k) => `"${String(r[k] ?? '').replace(/"/g, '""')}"`).join(','));
+  const csv = '﻿' + [header.join(','), ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `待发放邀请奖励-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function renderInviteRewards(data) {
+  const target = el('#inviteRewardList');
+  if (!target) return;
+  const rewards = data?.rewards || [];
+  const yuan = (cents) => `¥${(Math.max(0, Number(cents || 0)) / 100).toFixed(0)}`;
+  const summary = `<div class="invite-admin-summary">
+    <span>待发放：${Number(data?.pendingCount || 0)} 条 · ${yuan(data?.totalPendingCents)}</span>
+    <span>已发放：${Number(data?.claimedCount || 0)} 条 · ${yuan(data?.totalClaimedCents)}</span>
+    <button class="btn" id="inviteExportBtn" type="button">导出待发放</button>
+  </div>`;
+  if (!rewards.length) {
+    target.innerHTML = `${summary}<div class="status">还没有邀请奖励。</div>`;
+    return;
+  }
+  target.innerHTML = `
+    ${summary}
+    <table class="student-table invite-reward-table">
+      <thead><tr><th>邀请人</th><th>被邀请人</th><th>兑换码</th><th>奖励</th><th>状态</th><th>时间</th><th>操作</th></tr></thead>
+      <tbody>${rewards.map((reward) => `
+        <tr>
+          <td>${escapeHtml(reward.inviter || '')}</td>
+          <td>${escapeHtml(reward.invitee || '')}</td>
+          <td><code>${escapeHtml(reward.redemptionCode || '')}</code></td>
+          <td>${yuan(reward.amountCents)}</td>
+          <td><span class="admin-badge ${reward.status === 'claimed' ? 'on' : 'default'}">${reward.status === 'claimed' ? '已发放' : '待发放'}</span></td>
+          <td>${formatTime(reward.claimedAt || reward.createdAt)}</td>
+          <td>${reward.status === 'pending' ? `<button class="conversation-action" data-claim-reward="${escapeAttr(reward.id)}" type="button">标记已发放</button>` : ''}</td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+function renderAgentProfiles() {
+  const target = el('#agentProfileList');
+  if (!target) return;
+  const keys = state.agentProfileKeys?.length ? state.agentProfileKeys : Object.keys(state.agentProfiles || {});
+  if (!keys.length) {
+    target.innerHTML = '<div class="status">还没有可配置人设。</div>';
+    return;
+  }
+  target.innerHTML = keys.map((key) => {
+    const profile = state.agentProfiles?.[key] || state.agentProfileDefaults?.[key] || {};
+    return `
+      <section class="agent-profile-editor" data-agent-profile="${escapeAttr(key)}">
+        <div class="agent-profile-head">
+          <div>
+            <h3>${escapeHtml(profile.label || key)}</h3>
+            <p>${escapeHtml((profile.subjects || []).join('、') || '未设置科目')}</p>
+          </div>
+          <span class="admin-badge on">${escapeHtml(agentProfileKeyLabel(key))}</span>
+        </div>
+        <div class="provider-form">
+          <div class="form-field">
+            <label>显示名称</label>
+            <input class="input" data-agent-field="label" value="${escapeAttr(profile.label || '')}" maxlength="40" />
+          </div>
+          <div class="form-field">
+            <label>覆盖科目</label>
+            <input class="input" data-agent-field="subjects" value="${escapeAttr((profile.subjects || []).join('、'))}" placeholder="用顿号或逗号分隔" />
+          </div>
+          <div class="form-field wide">
+            <label>教学风格提示词</label>
+            <textarea class="textarea agent-profile-prompt" data-agent-field="prompt" maxlength="2200">${escapeHtml(profile.prompt || '')}</textarea>
+          </div>
+        </div>
+      </section>`;
+  }).join('');
+}
+
+function renderAgentRouteLogs(logs) {
+  const target = el('#agentRouteLogList');
+  if (!target) return;
+  if (!logs?.length) {
+    target.innerHTML = '<div class="status">还没有 Agent 路由记录。</div>';
+    return;
+  }
+  target.innerHTML = `
+    <table class="student-table agent-route-table">
+      <thead><tr><th>时间</th><th>人设</th><th>命中原因</th><th>问题摘录</th><th>账号 / 会话</th></tr></thead>
+      <tbody>${logs.map((log) => `
+        <tr>
+          <td>${escapeHtml(formatTime(log.createdAt))}<br><span class="status">${escapeHtml(log.action || '')} · ${escapeHtml(log.chatMode || '')}</span></td>
+          <td><span class="admin-badge on">${escapeHtml(log.label || '')}</span><br><span class="status">${escapeHtml(log.subject || '')}</span></td>
+          <td>${renderAgentRouteReasons(log)}</td>
+          <td class="route-excerpt">${escapeHtml(log.queryExcerpt || '')}</td>
+          <td>${escapeHtml(log.student || '')}<br><span class="status">${escapeHtml(log.conversationTitle || log.conversationId || '')}</span></td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+function renderAgentRouteReasons(log) {
+  const topics = Array.isArray(log.topics) ? log.topics : [];
+  const keywords = Array.isArray(log.keywords) ? log.keywords : [];
+  const chips = [...new Set([...topics, ...keywords])].slice(0, 10);
+  return chips.length
+    ? chips.map((item) => `<span class="route-chip">${escapeHtml(item)}</span>`).join('')
+    : '<span class="status">未命中关键词，走通用兜底。</span>';
+}
+
+function agentProfileKeyLabel(key) {
+  return {
+    math: '数学',
+    probability: '概率统计',
+    english: '英语',
+    politics: '政治',
+    cs: '数据结构',
+    general: '通用'
+  }[String(key || '')] || String(key || '');
+}
+
+function collectAgentProfilesFromForm() {
+  const profiles = {};
+  document.querySelectorAll('[data-agent-profile]').forEach((section) => {
+    const key = section.dataset.agentProfile;
+    const label = section.querySelector('[data-agent-field="label"]')?.value || '';
+    const subjectsRaw = section.querySelector('[data-agent-field="subjects"]')?.value || '';
+    const prompt = section.querySelector('[data-agent-field="prompt"]')?.value || '';
+    profiles[key] = {
+      label: label.trim(),
+      subjects: subjectsRaw.split(/[、,，]/).map((item) => item.trim()).filter(Boolean),
+      prompt: prompt.trim()
+    };
+  });
+  return profiles;
+}
+
+async function saveAgentProfiles(event) {
+  event.preventDefault();
+  try {
+    const data = await api('/admin/agent-profiles', { method: 'PUT', body: { profiles: collectAgentProfilesFromForm() } });
+    state.agentProfiles = data.profiles || state.agentProfiles;
+    renderAgentProfiles();
+    setAdminStatus(data.fileSaved === false ? '人设已保存到数据库，但配置文件写入失败。' : 'Agent 人设已保存。', data.fileSaved === false);
+  } catch (err) {
+    setAdminStatus(`保存人设失败：${err.message}`, true);
+  }
+}
+
+async function resetAgentProfilesToDefault() {
+  if (!confirm('确定恢复默认 Agent 人设？')) return;
+  try {
+    const data = await api('/admin/agent-profiles', { method: 'PUT', body: { profiles: state.agentProfileDefaults || {} } });
+    state.agentProfiles = data.profiles || state.agentProfileDefaults || {};
+    renderAgentProfiles();
+    setAdminStatus('Agent 人设已恢复默认。');
+  } catch (err) {
+    setAdminStatus(`恢复失败：${err.message}`, true);
+  }
+}
+
+function planLabel(plan) {
+  const key = String(plan || '').toLowerCase();
+  return state.membershipPlans?.[key]?.label || key || 'free';
+}
+
+function redemptionValueText(code) {
+  if (String(code?.plan || '').toLowerCase() === 'zhenti') {
+    const until = state.membershipPlans?.zhenti?.accessUntil;
+    return `到 ${formatDateOnly(until) || '12.22'}`;
+  }
+  if (String(code?.plan || '').toLowerCase() === 'tongji') {
+    const until = state.membershipPlans?.tongji?.accessUntil;
+    return `432到 ${formatDateOnly(until) || '12.22'}`;
+  }
+  return `${Number(code.credits || 0)}点 / ${Number(code.duration_days || 0)}天`;
+}
+
+function adminZhentiStatus(student) {
+  const paidUntil = student?.zhenti_paid_until;
+  if (paidUntil && new Date(paidUntil).getTime() > Date.now()) return `已开通到 ${formatDateOnly(paidUntil)}`;
+  const trialUntil = student?.zhenti_trial_expires_at;
+  if (trialUntil && new Date(trialUntil).getTime() > Date.now()) return `试用到 ${formatDateOnly(trialUntil)}`;
+  return '未开通';
+}
+
+async function createRedemptionCodes(event) {
+  event.preventDefault();
+  const body = {
+    plan: el('#redemptionPlan')?.value || 'se',
+    count: Number(el('#redemptionCount')?.value || 1),
+    note: el('#redemptionNote')?.value || '',
+    batch: el('#redemptionBatch')?.value || '',
+    expiresInDays: Number(el('#redemptionExpires')?.value || 0)
+  };
+  try {
+    const data = await api('/admin/redemption-codes', { method: 'POST', body });
+    setAdminStatus(`已生成 ${data.codes?.length || 0} 个兑换码。`);
+    if (el('#redemptionNote')) el('#redemptionNote').value = '';
+    await loadAdmin();
+  } catch (err) {
+    setAdminStatus(`生成失败：${err.message}`, true);
+  }
+}
+
+async function voidRedemptionCode(code) {
+  if (!code || !window.confirm(`确定作废兑换码 ${code}？作废后无法兑换。`)) return;
+  try {
+    await api('/admin/redemption-codes/void', { method: 'POST', body: { code } });
+    setAdminStatus(`已作废 ${code}。`);
+    await loadAdmin();
+  } catch (err) {
+    setAdminStatus(`作废失败：${err.message}`, true);
+  }
+}
+
+async function claimInviteReward(id) {
+  if (!id) return;
+  try {
+    await api('/admin/invite-rewards/claim', { method: 'POST', body: { id } });
+    setAdminStatus('已标记为已发放。');
+    await loadAdmin();
+  } catch (err) {
+    setAdminStatus(`操作失败：${err.message}`, true);
+  }
+}
+
+function exportRedemptionCsv() {
+  const all = state.redemptionCodes || [];
+  if (!all.length) { setAdminStatus('暂无兑换码可导出。', true); return; }
+  const header = ['code', 'plan', 'batch', 'status', 'expires_at', 'redeemed_by', 'redeemed_at', 'created_at', 'note'];
+  const rows = all.map((c) => header.map((k) => `"${String(c[k] ?? '').replace(/"/g, '""')}"`).join(','));
+  const csv = '﻿' + [header.join(','), ...rows].join('\r\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `兑换码-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function fillProviderForm(provider) {
@@ -4605,6 +6550,8 @@ function fillProviderForm(provider) {
   el('#providerModel').value = provider.model;
   el('#providerTemperature').value = provider.temperature;
   el('#providerMaxTokens').value = provider.max_tokens;
+  el('#providerReasoningEffort').value = provider.reasoning_effort || '';
+  el('#providerModelKey').value = provider.model_key || '';
   el('#providerEnabled').checked = Boolean(provider.enabled);
   el('#providerDefault').checked = Boolean(provider.is_default);
 }
@@ -4615,6 +6562,8 @@ function resetProviderForm() {
   el('#providerId').value = '';
   el('#providerTemperature').value = '0.3';
   el('#providerMaxTokens').value = '4096';
+  el('#providerReasoningEffort').value = '';
+  el('#providerModelKey').value = '';
 }
 
 async function saveProvider(event) {
@@ -4628,6 +6577,8 @@ async function saveProvider(event) {
     model: el('#providerModel').value,
     temperature: Number(el('#providerTemperature').value),
     max_tokens: Number(el('#providerMaxTokens').value),
+    reasoning_effort: el('#providerReasoningEffort').value,
+    model_key: el('#providerModelKey').value,
     enabled: el('#providerEnabled').checked,
     is_default: el('#providerDefault').checked
   };
@@ -4674,6 +6625,47 @@ function setAdminStatus(text, error = false) {
   status.className = error ? 'status error' : 'status';
 }
 
+function appendAgentTrace(messageId, data) {
+  const box = document.getElementById(`${messageId}_trace`);
+  if (!box || !data?.type) return;
+  const item = formatAgentTrace(data);
+  if (!item) return;
+  box.classList.add('visible');
+  if (data.type === 'tool_done' && data.tool) {
+    const running = [...box.querySelectorAll(`[data-trace-tool="${cssEscape(data.tool)}"][data-trace-state="running"]`)].pop();
+    if (running) {
+      running.className = `agent-trace-item ${item.className || ''}`.trim();
+      running.dataset.traceState = item.state || 'done';
+      running.textContent = item.text;
+      return;
+    }
+  }
+  const node = document.createElement('span');
+  node.className = `agent-trace-item ${item.className || ''}`.trim();
+  node.textContent = item.text;
+  if (data.tool) node.dataset.traceTool = data.tool;
+  if (item.state) node.dataset.traceState = item.state;
+  box.appendChild(node);
+}
+
+function formatAgentTrace(data) {
+  if (data.type === 'agent_profile') {
+    return { text: `已选择 ${data.label || '全科答疑'}`, className: 'profile', state: 'done' };
+  }
+  if (data.type === 'tool_start') {
+    return { text: `调用${data.label || 'Agent 工具'}...`, className: 'running', state: 'running' };
+  }
+  if (data.type === 'tool_done') {
+    const suffix = data.ok ? '✓' : '未完成';
+    const count = Number.isFinite(Number(data.count)) ? ` · ${Number(data.count)}条` : '';
+    return { text: `调用了${data.label || 'Agent 工具'} ${suffix}${data.ok ? count : ''}`, className: data.ok ? 'done' : 'error', state: data.ok ? 'done' : 'error' };
+  }
+  if (data.type === 'agent_fallback') {
+    return { text: data.label || '工具调用失败，已切回普通流式', className: 'error', state: 'error' };
+  }
+  return null;
+}
+
 function updateThinkLine(node, startedAt, label) {
   if (!node) return;
   const text = node.querySelector('.think-text');
@@ -4716,7 +6708,13 @@ async function flushStreamingRender(target, raw) {
 }
 
 async function renderMessageContent(target, raw) {
-  target.innerHTML = renderMarkdown(raw);
+  const html = renderMarkdown(raw);
+  if (target.classList.contains('streaming')) {
+    applyStreamingHtml(target, html);
+  } else {
+    target.__kcBlocks = null;
+    target.innerHTML = html;
+  }
   enhanceAnswerSections(target.closest('article.message') || target);
   enhanceCodeBlocks(target);
   const completeMath = hasCompleteMathSegment(raw);
@@ -4729,6 +6727,27 @@ async function renderMessageContent(target, raw) {
   if (isStreaming) {
     queueMathRecovery(target, [450, 1200, 2600]);
   }
+}
+
+function applyStreamingHtml(target, html) {
+  const temp = document.createElement('div');
+  temp.innerHTML = html;
+  const loose = [...temp.childNodes].some((node) => node.nodeType !== 1 && String(node.textContent || '').trim());
+  const nextBlocks = [...temp.children].map((node) => node.outerHTML);
+  const prevBlocks = Array.isArray(target.__kcBlocks) ? target.__kcBlocks : null;
+  if (loose || !prevBlocks) {
+    target.innerHTML = html;
+    target.__kcBlocks = loose ? null : nextBlocks;
+    return;
+  }
+  let stable = 0;
+  const limit = Math.min(prevBlocks.length, nextBlocks.length);
+  while (stable < limit && prevBlocks[stable] === nextBlocks[stable]) stable += 1;
+  while (target.children.length > stable) target.removeChild(target.lastElementChild);
+  if (stable < nextBlocks.length) {
+    target.insertAdjacentHTML('beforeend', nextBlocks.slice(stable).join(''));
+  }
+  target.__kcBlocks = nextBlocks;
 }
 
 async function readSse(response, handlers, signal) {
@@ -5024,12 +7043,15 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined
   });
   if (!response.ok) throw new Error(await errorText(response));
-  return response.json();
+  const data = await response.json();
+  if (data?.quota) updateQuota(data.quota);
+  return data;
 }
 
 async function errorText(response) {
   try {
     const data = await response.json();
+    if (data?.quota) updateQuota(data.quota);
     return data.message || data.error || response.statusText;
   } catch {
     return response.statusText;
@@ -5110,13 +7132,11 @@ function escapeRegExp(value) {
 }
 
 function draftStorageKey(conversationId = state.currentConversationId) {
-  const studentNo = state.student?.studentNo || 'guest';
-  return `${DRAFT_PREFIX}${studentNo}:${conversationId || 'new'}`;
+  return `${DRAFT_PREFIX}${studentLabel(state.student)}:${conversationId || 'new'}`;
 }
 
 function composerHistoryStorageKey() {
-  const studentNo = state.student?.studentNo || 'guest';
-  return `${COMPOSER_HISTORY_PREFIX}${studentNo}`;
+  return `${COMPOSER_HISTORY_PREFIX}${studentLabel(state.student)}`;
 }
 
 function loadComposerHistory() {
@@ -5133,7 +7153,7 @@ function loadComposerHistory() {
 }
 
 function customPromptsStorageKey() {
-  return `${CUSTOM_PROMPTS_PREFIX}${state.student?.studentNo || 'anonymous'}`;
+  return `${CUSTOM_PROMPTS_PREFIX}${studentLabel(state.student)}`;
 }
 
 function loadCustomPrompts() {
@@ -5297,6 +7317,17 @@ function loadStoredBool(key) {
   }
 }
 
+function loadStoredRightRailOpen() {
+  try {
+    const stored = localStorage.getItem('kc_right_rail');
+    if (stored === '1') return true;
+    if (stored === '0') return false;
+  } catch {}
+  return typeof window !== 'undefined' && window.matchMedia
+    ? window.matchMedia('(min-width: 1280px)').matches
+    : true;
+}
+
 function loadStoredSidebarCollapsed() {
   try {
     const stored = localStorage.getItem('kc_sidebar_collapsed');
@@ -5321,4 +7352,11 @@ function formatTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatDateOnly(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString('zh-CN');
 }

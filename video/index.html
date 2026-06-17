@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  #stage {
+    position: relative;
+    width: 1280px; height: 720px;
+    overflow: hidden;
+    font-family: "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    background: linear-gradient(180deg, #eef7f2 0%, #fbfcff 42%);
+    color: #1d2733;
+  }
+  .clip { position: absolute; inset: 0; }
+
+  /* ---------- shared mock-UI pieces ---------- */
+  .scene { display: grid; place-items: center; }
+  .scene-inner { width: 980px; display: grid; gap: 26px; }
+  .step-kicker {
+    justify-self: start;
+    padding: 6px 16px;
+    border-radius: 999px;
+    background: #1f7a53; color: #fff;
+    font-size: 22px; font-weight: 800;
+  }
+  .scene h1 { font-size: 44px; font-weight: 860; line-height: 1.2; }
+  .scene .sub { font-size: 24px; color: #5b6878; line-height: 1.6; }
+
+  .mock {
+    border: 1px solid #dde4ec;
+    border-radius: 18px;
+    background: #fff;
+    box-shadow: 0 24px 70px rgba(38, 53, 84, 0.12);
+    padding: 26px;
+  }
+
+  /* scene 1: mode switch */
+  .mode-row { display: flex; gap: 14px; align-items: center; }
+  .mode-btn {
+    flex: 1;
+    padding: 20px 24px;
+    border: 2px solid #dde4ec;
+    border-radius: 14px;
+    background: #f7f9fc;
+    font-size: 24px; font-weight: 800; color: #5b6878;
+    display: grid; gap: 6px;
+  }
+  .mode-btn small { font-size: 17px; font-weight: 600; color: #8b97a6; }
+  .mode-btn.agent.on {
+    border-color: #1f7a53;
+    background: #eaf7f1;
+    color: #15543a;
+    box-shadow: 0 0 0 4px rgba(31, 122, 83, 0.15);
+  }
+  #cursor {
+    position: absolute;
+    top: 0; left: 0; /* anchor at canvas origin so GSAP x/y are absolute coords */
+    width: 34px; height: 34px;
+    z-index: 9;
+    filter: drop-shadow(0 3px 6px rgba(0,0,0,0.3));
+  }
+
+  /* scene 2: composer */
+  .composer {
+    border: 2px solid #1f7a53;
+    border-radius: 16px;
+    background: #fcfffd;
+    padding: 22px;
+    font-size: 23px;
+    line-height: 1.65;
+    min-height: 170px;
+    color: #1d2733;
+  }
+  .composer .caret { border-right: 3px solid #1f7a53; animation: none; }
+  .tip-good { color: #15803d; font-weight: 800; }
+  .tip-bad { color: #b91c1c; font-weight: 800; text-decoration: line-through; }
+
+  /* scene 3: trace */
+  .trace-list { display: grid; gap: 14px; }
+  .trace-item {
+    display: flex; align-items: center; gap: 14px;
+    padding: 16px 20px;
+    border: 1px solid #d9e8e0;
+    border-radius: 12px;
+    background: #f4faf7;
+    font-size: 23px; font-weight: 700; color: #1d4734;
+  }
+  .trace-item .dot {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #1f9d63;
+  }
+  .trace-item small { margin-left: auto; color: #5b8a73; font-size: 19px; font-weight: 600; }
+
+  /* scene 4: answer */
+  .answer-card { display: grid; gap: 16px; font-size: 23px; line-height: 1.6; }
+  .answer-card .formula {
+    padding: 16px 22px;
+    border-radius: 12px;
+    background: #f2f6ff;
+    color: #1d3a8f;
+    font-size: 27px; font-weight: 700;
+    font-family: "Times New Roman", serif;
+    font-style: italic;
+  }
+  .verified {
+    display: inline-flex; align-items: center; gap: 10px;
+    justify-self: start;
+    padding: 8px 18px;
+    border-radius: 999px;
+    background: #eaf7f1; color: #15543a;
+    font-size: 21px; font-weight: 800;
+    border: 1px solid #b9dfcc;
+  }
+
+  /* outro */
+  .outro { text-align: center; display: grid; gap: 18px; justify-items: center; }
+  .outro .logo {
+    width: 92px; height: 92px; border-radius: 50%;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, #2f6df3, #e56c43);
+    color: #fff; font-size: 40px; font-weight: 850;
+  }
+</style>
+</head>
+<body>
+<div id="stage" data-composition-id="agent-tutorial" data-start="0" data-width="1280" data-height="720">
+
+  <!-- Scene 1 · 0-5s · switch to Agent mode -->
+  <section class="clip scene" id="s1" data-start="0" data-duration="5" data-track-index="0">
+    <div class="scene-inner">
+      <div class="step-kicker">第 1 步 · 切换模式</div>
+      <h1>点「Agent 解题」进入解题工作台</h1>
+      <p class="sub">输入框上方的两个按钮随时可切换，选择会被记住。</p>
+      <div class="mock">
+        <div class="mode-row">
+          <div class="mode-btn" id="qaBtn">普通问答<small>直接回答，适合快问快答</small></div>
+          <div class="mode-btn agent" id="agentBtn">Agent 解题<small>先规划再解题，自动验算 / 检索</small></div>
+        </div>
+      </div>
+    </div>
+    <svg id="cursor" viewBox="0 0 24 24"><path fill="#1d2733" stroke="#fff" stroke-width="1.5" d="M5 3l14 9-6.5 1.2L16 19l-3 1.6-3.4-5.8L5 19V3z"/></svg>
+  </section>
+
+  <!-- Scene 2 · 5-11s · send the full problem -->
+  <section class="clip scene" id="s2" data-start="5" data-duration="6" data-track-index="0">
+    <div class="scene-inner">
+      <div class="step-kicker">第 2 步 · 发完整题干</div>
+      <h1>一次发完整题目，别拆着问</h1>
+      <p class="sub"><span class="tip-bad">“这题怎么做”</span>&nbsp;→&nbsp;<span class="tip-good">完整题干 + 想检查的步骤</span></p>
+      <div class="mock">
+        <div class="composer"><span id="typed"></span><span class="caret">&nbsp;</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scene 3 · 11-16s · watch the trace -->
+  <section class="clip scene" id="s3" data-start="11" data-duration="5" data-track-index="0">
+    <div class="scene-inner">
+      <div class="step-kicker">第 3 步 · 看执行记录</div>
+      <h1>回答上方实时显示它做了什么</h1>
+      <p class="sub">Agent 会先选学科人设，再调用工具核对，不是凭记忆硬答。</p>
+      <div class="mock">
+        <div class="trace-list">
+          <div class="trace-item" id="t1"><span class="dot"></span>人设路由 · 数学严谨派<small>已命中「高等数学」</small></div>
+          <div class="trace-item" id="t2"><span class="dot"></span>公式验算 · SymPy<small>验算通过 ✓</small></div>
+          <div class="trace-item" id="t3"><span class="dot"></span>知识库检索<small>找到 2 条同类解法</small></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Scene 4 · 16-21s · verified answer + outro -->
+  <section class="clip scene" id="s4" data-start="16" data-duration="5" data-track-index="0">
+    <div class="scene-inner">
+      <div class="step-kicker">第 4 步 · 拿到验算过的答案</div>
+      <h1>结论是机器验算过的</h1>
+      <div class="mock answer-card">
+        <div>思路 → 分部积分两次，再代入上下限：</div>
+        <div class="formula">∫₀¹ x²eˣ dx = e − 2</div>
+        <div class="verified">✓ SymPy 验算通过 · 与推导一致</div>
+      </div>
+      <p class="sub">复杂推导、图片题、408 算法题，都交给 Agent 解题。</p>
+    </div>
+  </section>
+
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    const tl = gsap.timeline({ paused: true });
+
+    // scene 1: cursor flies to the Agent button, clicks, button lights up
+    gsap.set('#cursor', { x: 420, y: 600, opacity: 0 });
+    tl.from('#s1 .scene-inner', { opacity: 0, y: 36, duration: 0.5 }, 0)
+      .to('#cursor', { opacity: 1, duration: 0.25 }, 0.8)
+      .to('#cursor', { x: 868, y: 452, duration: 1.1, ease: 'power2.inOut' }, 1.0)
+      .to('#cursor', { scale: 0.82, duration: 0.12, yoyo: true, repeat: 1 }, 2.2)
+      .add(() => document.getElementById('agentBtn').classList.add('on'), 2.35)
+      .to('#agentBtn', { scale: 1.04, duration: 0.18, yoyo: true, repeat: 1 }, 2.35)
+      .to('#cursor', { opacity: 0, duration: 0.3 }, 4.0);
+
+    // scene 2: type the recommended prompt
+    const promptText = '求定积分 ∫₀¹ x²eˣ dx 的精确值，请完整推导，并检查我分部积分的符号。';
+    tl.from('#s2 .scene-inner', { opacity: 0, y: 36, duration: 0.5 }, 5.0);
+    const typed = document.getElementById('typed');
+    const startType = 5.8, typeDur = 3.6;
+    for (let i = 1; i <= promptText.length; i++) {
+      tl.add(() => { typed.textContent = promptText.slice(0, i); },
+        startType + (typeDur * i) / promptText.length);
+    }
+
+    // scene 3: trace items pop in one by one
+    tl.from('#s3 .scene-inner', { opacity: 0, y: 36, duration: 0.5 }, 11.0)
+      .from('#t1', { opacity: 0, x: -36, duration: 0.4 }, 11.8)
+      .from('#t2', { opacity: 0, x: -36, duration: 0.4 }, 12.6)
+      .from('#t3', { opacity: 0, x: -36, duration: 0.4 }, 13.4)
+      .fromTo('#t2 .dot', { scale: 1 }, { scale: 1.7, duration: 0.3, yoyo: true, repeat: 3 }, 13.0);
+
+    // scene 4: answer card + verified badge
+    tl.from('#s4 .scene-inner', { opacity: 0, y: 36, duration: 0.5 }, 16.0)
+      .from('#s4 .formula', { opacity: 0, scale: 0.92, duration: 0.45 }, 16.9)
+      .from('#s4 .verified', { opacity: 0, y: 14, duration: 0.4 }, 17.8)
+      .to('#s4 .verified', { scale: 1.06, duration: 0.25, yoyo: true, repeat: 1 }, 18.3);
+
+    window.__timelines = { 'agent-tutorial': tl };
+  </script>
+</div>
+</body>
+</html>
