@@ -3500,11 +3500,9 @@ async function streamOpenAICompatibleSimple(res, provider, systemPrompt, recentM
   const payload = {
     model: provider.model,
     messages,
-    stream: true,
-    temperature: provider.temperature
+    stream: true
   };
-  if (provider.max_tokens) payload.max_tokens = provider.max_tokens;
-  applyReasoningSettings(provider, payload);
+  applyOpenAICompatiblePayloadSettings(provider, payload, { maxTokens: provider.max_tokens });
   const url = joinUrl(provider.base_url, '/chat/completions');
   const upstream = await fetchWithTimeout(url, {
     method: 'POST',
@@ -3611,10 +3609,9 @@ async function runAgentTool(name, argsRaw, trace = null) {
 }
 
 async function streamOpenAIToolRound(res, provider, messages, tools, signal) {
-  const payload = { model: provider.model, messages, stream: true, temperature: provider.temperature };
-  if (provider.max_tokens) payload.max_tokens = provider.max_tokens;
+  const payload = { model: provider.model, messages, stream: true };
+  applyOpenAICompatiblePayloadSettings(provider, payload, { maxTokens: provider.max_tokens });
   if (tools) { payload.tools = tools; payload.tool_choice = 'auto'; }
-  applyReasoningSettings(provider, payload);
   const upstream = await fetchWithTimeout(joinUrl(provider.base_url, '/chat/completions'), {
     method: 'POST',
     headers: { Authorization: `Bearer ${provider.api_key}`, 'Content-Type': 'application/json' },
@@ -3699,9 +3696,8 @@ async function streamOpenAICompatible(res, provider, systemPrompt, recentMessage
 
 async function callOpenAICompatibleOnce(provider, systemPrompt, recentMessages) {
   const messages = [{ role: 'system', content: systemPrompt }, ...recentMessages.map(toOpenAIMessage)];
-  const payload = { model: provider.model, messages, stream: false, temperature: provider.temperature };
-  if (provider.max_tokens) payload.max_tokens = Math.min(provider.max_tokens, 1024);
-  applyReasoningSettings(provider, payload);
+  const payload = { model: provider.model, messages, stream: false };
+  applyOpenAICompatiblePayloadSettings(provider, payload, { maxTokens: provider.max_tokens ? Math.min(provider.max_tokens, 1024) : 0 });
   const upstream = await fetchWithTimeout(joinUrl(provider.base_url, '/chat/completions'), {
     method: 'POST',
     headers: { Authorization: `Bearer ${provider.api_key}`, 'Content-Type': 'application/json' },
@@ -4253,8 +4249,8 @@ async function callTextLlm(systemPrompt, userText, maxTokens = 2048) {
 
 async function callOpenAITextOnce(provider, systemPrompt, recentMessages, maxTokens) {
   const messages = [{ role: 'system', content: systemPrompt }, ...recentMessages.map(toOpenAIMessage)];
-  const payload = { model: provider.model, messages, stream: false, temperature: provider.temperature, max_tokens: maxTokens };
-  applyReasoningSettings(provider, payload);
+  const payload = { model: provider.model, messages, stream: false };
+  applyOpenAICompatiblePayloadSettings(provider, payload, { maxTokens });
   const upstream = await fetchWithTimeout(joinUrl(provider.base_url, '/chat/completions'), {
     method: 'POST',
     headers: { Authorization: `Bearer ${provider.api_key}`, 'Content-Type': 'application/json' },
@@ -5686,6 +5682,20 @@ function applyReasoningSettings(provider, payload) {
   if (provider.type === 'openai-compatible' && /gpt|gemini|thinking|claude|opus/.test(model)) {
     payload.reasoning_effort = effort || 'max';
   }
+}
+
+function applyOpenAICompatiblePayloadSettings(provider, payload, options = {}) {
+  const model = String(provider.model || '').toLowerCase();
+  const maxTokens = Number(options.maxTokens || 0);
+  if (maxTokens > 0) payload.max_tokens = Math.floor(maxTokens);
+  if (!openAICompatibleDisallowsTemperature(model)) {
+    payload.temperature = provider.temperature;
+  }
+  applyReasoningSettings(provider, payload);
+}
+
+function openAICompatibleDisallowsTemperature(model) {
+  return /claude-opus-4-8|opus-4-8/.test(String(model || '').toLowerCase());
 }
 
 function startSse(res) {
