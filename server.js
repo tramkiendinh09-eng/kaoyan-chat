@@ -711,9 +711,7 @@ async function apiTopicMastery(req, res) {
 async function apiPublicProviders(req, res) {
   const student = requireStudent(req, res);
   if (!student) return;
-  const planKey = activePlanKey(student);
   const providers = db.prepare('SELECT id, name, type, model, enabled, is_default, model_key FROM providers WHERE enabled = 1 ORDER BY is_default DESC, id ASC').all()
-    .filter((provider) => planKey !== 'free' || providerModelKey(provider) === 'gpt55')
     .map((provider) => publicProvider(provider, student));
   return sendJson(res, 200, { providers });
 }
@@ -5261,16 +5259,6 @@ function getStudentQuota(student) {
 function reserveQuestionQuota(student, provider, action, context = {}) {
   const quotaDate = currentQuotaDate();
   const planKey = activePlanKey(student);
-  const modelKey = providerModelKey(provider);
-  if (planKey === 'free' && modelKey !== 'gpt55') {
-    return {
-      ok: false,
-      status: 403,
-      error: 'model_requires_membership',
-      message: '免费账号只能使用 GPT-5.5。开通会员后可使用 Gemini 和 Opus 4.8。',
-      quota: getStudentQuota(student)
-    };
-  }
   const limit = quotaLimitForStudent(student);
   const usage = quotaUsageForStudent(student, quotaDate);
   const cost = chatModeCreditCost(provider, context.chatMode);
@@ -5481,7 +5469,7 @@ function publicProvider(provider, student = null) {
     is_default: Boolean(provider.is_default),
     modelKey,
     creditCost: modelCreditCost(provider),
-    available: !student || activePlanKey(student) !== 'free' || modelKey === 'gpt55'
+    available: true
   };
 }
 
