@@ -34,8 +34,8 @@ const QUOTA_TIME_ZONE = process.env.QUOTA_TIME_ZONE || 'Asia/Shanghai';
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://fengqingyun.top/chat/';
 const DIGEST_SEND_HOUR = Number(process.env.DIGEST_SEND_HOUR || 21);
 const MEMBERSHIP_PLANS = {
-  se: { label: 'SE', credits: 700, durationDays: 30 },
-  plus: { label: 'Plus', credits: 1000, durationDays: 30 }
+  se: { label: 'SE', credits: 700, durationDays: 30, priceCents: 3990 },
+  plus: { label: 'Plus', credits: 1000, durationDays: 30, priceCents: 5990 }
 };
 const ZHENTI_TRIAL_DAYS = Number(process.env.ZHENTI_TRIAL_DAYS || 14);
 const ZHENTI_ACCESS_END_DATE = process.env.ZHENTI_ACCESS_END_DATE || '2026-12-22';
@@ -64,6 +64,7 @@ const REDEMPTION_PLANS = {
   }
 };
 const MODEL_CREDIT_COSTS = { gpt55: 1, gemini: 3, opus: 5, other: 1 };
+const AGENT_CHAT_CREDIT_COST = Number(process.env.AGENT_CHAT_CREDIT_COST || 2);
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || 'true') !== 'false';
@@ -1228,7 +1229,7 @@ async function apiChat(req, res) {
 
     const provider = selectProvider(body.providerId || conv.model_id);
     const userMessageId = randomId('msg');
-    const quotaReservation = reserveQuestionQuota(student, provider, 'chat', { conversationId, userMessageId });
+    const quotaReservation = reserveQuestionQuota(student, provider, 'chat', { conversationId, userMessageId, chatMode });
     if (!quotaReservation.ok) return sendQuotaExceeded(res, quotaReservation);
     try {
       db.prepare('INSERT INTO messages (id, conversation_id, role, content, attachments_json, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(
@@ -1361,7 +1362,7 @@ async function apiEditChat(req, res) {
     if (!userMessage) return sendJson(res, 404, { error: 'message_not_found', message: '找不到可编辑的问题。' });
 
     const provider = selectProvider(body.providerId || conv.model_id);
-    const quotaReservation = reserveQuestionQuota(student, provider, 'edit', { conversationId, userMessageId: userMessage.id });
+    const quotaReservation = reserveQuestionQuota(student, provider, 'edit', { conversationId, userMessageId: userMessage.id, chatMode });
     if (!quotaReservation.ok) return sendQuotaExceeded(res, quotaReservation);
     db.prepare('UPDATE conversations SET model_id = COALESCE(?, model_id), updated_at = ? WHERE id = ?').run(provider ? provider.id : null, nowIso(), conversationId);
 
@@ -1518,7 +1519,7 @@ async function apiRetryChat(req, res) {
     }
 
     const provider = selectProvider(body.providerId || conv.model_id);
-    const quotaReservation = reserveQuestionQuota(student, provider, 'retry', { conversationId, userMessageId: userMessage.id });
+    const quotaReservation = reserveQuestionQuota(student, provider, 'retry', { conversationId, userMessageId: userMessage.id, chatMode });
     if (!quotaReservation.ok) return sendQuotaExceeded(res, quotaReservation);
     db.prepare('UPDATE conversations SET model_id = COALESCE(?, model_id), updated_at = ? WHERE id = ?').run(provider ? provider.id : null, nowIso(), conversationId);
 
@@ -1655,7 +1656,7 @@ async function apiContinueChat(req, res) {
     }
 
     const provider = selectProvider(body.providerId || conv.model_id);
-    const quotaReservation = reserveQuestionQuota(student, provider, 'continue', { conversationId });
+    const quotaReservation = reserveQuestionQuota(student, provider, 'continue', { conversationId, chatMode });
     if (!quotaReservation.ok) return sendQuotaExceeded(res, quotaReservation);
     db.prepare('UPDATE conversations SET model_id = COALESCE(?, model_id), updated_at = ? WHERE id = ?').run(provider ? provider.id : null, nowIso(), conversationId);
 
@@ -5169,6 +5170,11 @@ function modelCreditCost(provider) {
   return MODEL_CREDIT_COSTS[providerModelKey(provider)] || MODEL_CREDIT_COSTS.other;
 }
 
+function chatModeCreditCost(provider, chatMode) {
+  if (isAgentChatMode(chatMode)) return AGENT_CHAT_CREDIT_COST;
+  return modelCreditCost(provider);
+}
+
 function quotaLimitForStudent(student) {
   const planKey = activePlanKey(student);
   if (planKey !== 'free') return Number(student.membership_credits_total || membershipPlan(planKey)?.credits || 0);
@@ -5246,6 +5252,7 @@ function getStudentQuota(student) {
     remaining: Math.max(0, limit - usage.used - usage.reserved),
     membershipExpiresAt: planKey === 'free' ? null : student.membership_expires_at || null,
     modelCosts: MODEL_CREDIT_COSTS,
+    agentCost: AGENT_CHAT_CREDIT_COST,
     resetTimeZone: QUOTA_TIME_ZONE
   };
 }
@@ -5265,7 +5272,7 @@ function reserveQuestionQuota(student, provider, action, context = {}) {
   }
   const limit = quotaLimitForStudent(student);
   const usage = quotaUsageForStudent(student, quotaDate);
-  const cost = modelCreditCost(provider);
+  const cost = chatModeCreditCost(provider, context.chatMode);
   const remaining = limit - usage.used - usage.reserved;
   if (remaining <= 0) {
     return {

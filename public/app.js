@@ -1408,7 +1408,7 @@ function renderModeSwitchPanel() {
     <div class="mode-switch-panel" id="modeSwitchPanel" aria-label="答疑模式">
       <div class="mode-segment">
         <button class="mode-choice ${agentActive ? '' : 'active'}" data-chat-mode-choice="qa" type="button" aria-pressed="${agentActive ? 'false' : 'true'}" title="直接回答，适合快问快答">普通问答</button>
-        <button class="mode-choice ${agentActive ? 'active' : ''}" data-chat-mode-choice="agent" type="button" aria-pressed="${agentActive ? 'true' : 'false'}" title="先规划再解题，自动公式验算 / 知识库检索">Agent 解题</button>
+        <button class="mode-choice ${agentActive ? 'active' : ''}" data-chat-mode-choice="agent" type="button" aria-pressed="${agentActive ? 'true' : 'false'}" title="先规划再解题，自动公式验算 / 知识库检索，2点/次">Agent 解题 · 2点</button>
       </div>
       <button class="agent-help-btn" id="agentHelpBtn" type="button" title="使用教程" aria-label="使用教程">教程</button>
     </div>`;
@@ -2624,7 +2624,7 @@ function chatModeKicker() {
 
 function chatModeHint() {
   return state.chatMode === 'agent'
-    ? 'Agent 解题：启用人设路由和工具复核，适合复杂题。'
+    ? 'Agent 解题：启用人设路由和工具复核，适合复杂题，2点/次。'
     : '普通问答：不调用工具，响应更直接。';
 }
 
@@ -2855,7 +2855,7 @@ function renderEmptyState() {
       <div class="empty-state agent-empty-state">
         <div class="empty-brand-mark">研</div>
         <h2>Agent 解题工作台</h2>
-        <p>适合把复杂题、图片题、算法题和需要验算的推导一次性拆清楚。</p>
+        <p>适合把复杂题、图片题、算法题和需要验算的推导一次性拆清楚，按 2 点/次计入额度。</p>
         <div class="empty-mode-notes" aria-label="Agent 模式能力">
           <span>人设路由</span>
           <span>规划解题</span>
@@ -5950,8 +5950,8 @@ function renderAdminShell() {
             <div class="form-field">
               <label>套餐</label>
               <select class="input" id="redemptionPlan">
-                <option value="se">SE · 700点</option>
-                <option value="plus">Plus · 1000点</option>
+                <option value="se">SE · 39.9 · 700点</option>
+                <option value="plus">Plus · 59.9 · 1000点</option>
                 <option value="zhenti">数学/英语真题 · 到 12.22</option>
                 <option value="tongji">432 统计真题 · 到 12.22</option>
               </select>
@@ -6461,7 +6461,14 @@ async function resetAgentProfilesToDefault() {
 
 function planLabel(plan) {
   const key = String(plan || '').toLowerCase();
-  return state.membershipPlans?.[key]?.label || key || 'free';
+  const item = state.membershipPlans?.[key];
+  if (item?.priceCents) return `${item.label || key} · ${formatPlanPrice(item.priceCents)}`;
+  return item?.label || key || 'free';
+}
+
+function formatPlanPrice(cents) {
+  const yuan = Math.max(0, Number(cents || 0)) / 100;
+  return Number.isInteger(yuan) ? `${yuan}` : yuan.toFixed(1);
 }
 
 function redemptionValueText(code) {
