@@ -1408,7 +1408,7 @@ function renderModeSwitchPanel() {
     <div class="mode-switch-panel" id="modeSwitchPanel" aria-label="答疑模式">
       <div class="mode-segment">
         <button class="mode-choice ${agentActive ? '' : 'active'}" data-chat-mode-choice="qa" type="button" aria-pressed="${agentActive ? 'false' : 'true'}" title="直接回答，适合快问快答">普通问答</button>
-        <button class="mode-choice ${agentActive ? 'active' : ''}" data-chat-mode-choice="agent" type="button" aria-pressed="${agentActive ? 'true' : 'false'}" title="先规划再解题，自动公式验算 / 知识库检索，2点/次">Agent 解题 · 2点</button>
+        <button class="mode-choice ${agentActive ? 'active' : ''}" data-chat-mode-choice="agent" type="button" aria-pressed="${agentActive ? 'true' : 'false'}" title="先规划再解题，自动公式验算 / 知识库检索，按所选模型 2 倍额度计费">Agent 解题 · ×2</button>
       </div>
       <button class="agent-help-btn" id="agentHelpBtn" type="button" title="使用教程" aria-label="使用教程">教程</button>
     </div>`;
@@ -2624,7 +2624,7 @@ function chatModeKicker() {
 
 function chatModeHint() {
   return state.chatMode === 'agent'
-    ? 'Agent 解题：启用人设路由和工具复核，适合复杂题，2点/次。'
+    ? 'Agent 解题：启用人设路由和工具复核，适合复杂题，按所选模型 2 倍额度计费。'
     : '普通问答：不调用工具，响应更直接。';
 }
 
@@ -2855,7 +2855,7 @@ function renderEmptyState() {
       <div class="empty-state agent-empty-state">
         <div class="empty-brand-mark">研</div>
         <h2>Agent 解题工作台</h2>
-        <p>适合把复杂题、图片题、算法题和需要验算的推导一次性拆清楚，按 2 点/次计入额度。</p>
+        <p>适合把复杂题、图片题、算法题和需要验算的推导一次性拆清楚；GPT-5.5 / Gemini / Opus 分别按 2 / 6 / 10 点计入额度。</p>
         <div class="empty-mode-notes" aria-label="Agent 模式能力">
           <span>人设路由</span>
           <span>规划解题</span>

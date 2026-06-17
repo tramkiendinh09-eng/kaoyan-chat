@@ -64,7 +64,7 @@ const REDEMPTION_PLANS = {
   }
 };
 const MODEL_CREDIT_COSTS = { gpt55: 1, gemini: 3, opus: 5, other: 1 };
-const AGENT_CHAT_CREDIT_COST = Number(process.env.AGENT_CHAT_CREDIT_COST || 2);
+const AGENT_CHAT_CREDIT_MULTIPLIER = Math.max(1, Number(process.env.AGENT_CHAT_CREDIT_MULTIPLIER || 2));
 const SMTP_HOST = process.env.SMTP_HOST || '';
 const SMTP_PORT = Number(process.env.SMTP_PORT || 465);
 const SMTP_SECURE = String(process.env.SMTP_SECURE || 'true') !== 'false';
@@ -5171,8 +5171,9 @@ function modelCreditCost(provider) {
 }
 
 function chatModeCreditCost(provider, chatMode) {
-  if (isAgentChatMode(chatMode)) return AGENT_CHAT_CREDIT_COST;
-  return modelCreditCost(provider);
+  const modelCost = modelCreditCost(provider);
+  if (isAgentChatMode(chatMode)) return modelCost * AGENT_CHAT_CREDIT_MULTIPLIER;
+  return modelCost;
 }
 
 function quotaLimitForStudent(student) {
@@ -5252,7 +5253,7 @@ function getStudentQuota(student) {
     remaining: Math.max(0, limit - usage.used - usage.reserved),
     membershipExpiresAt: planKey === 'free' ? null : student.membership_expires_at || null,
     modelCosts: MODEL_CREDIT_COSTS,
-    agentCost: AGENT_CHAT_CREDIT_COST,
+    agentMultiplier: AGENT_CHAT_CREDIT_MULTIPLIER,
     resetTimeZone: QUOTA_TIME_ZONE
   };
 }
