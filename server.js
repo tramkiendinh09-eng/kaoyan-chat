@@ -5473,6 +5473,8 @@ function publicProviderName(provider) {
   const model = String(provider.model || '').toLowerCase();
   if (model.includes('gpt-5.5')) return 'GPT-5.5 深度思考';
   if (model.includes('claude-opus-4-8')) return 'Opus 4.8 深度思考';
+  if (model.includes('gemini-3.1-pro-high')) return 'Gemini 3.1 Pro High';
+  if (model.includes('gemini-3.1-pro-low')) return 'Gemini 3.1 Pro Low';
   if (model.includes('gemini-3.1-pro-preview-thinking')) return 'Gemini 3.1 Pro Thinking';
   return String(provider.name || '模型')
     .replace(/中转|relay|provider|openai-compatible|anthropic|claude messages/gi, '')
