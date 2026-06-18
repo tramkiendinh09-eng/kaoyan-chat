@@ -211,6 +211,7 @@ async function handleApi(req, res, apiPath, url) {
   if (req.method === 'POST' && apiPath === '/api/chat/continue') return apiContinueChat(req, res);
   if (req.method === 'POST' && apiPath === '/api/chat/stop') return apiStopChat(req, res);
   if (req.method === 'GET' && apiPath === '/api/chat/active') return apiChatActive(req, res, url);
+  if (req.method === 'POST' && apiPath === '/api/english/grade') return apiEnglishGrade(req, res);
 
   if (req.method === 'POST' && apiPath === '/api/admin/login') return apiAdminLogin(req, res);
   if (req.method === 'POST' && apiPath === '/api/admin/logout') return apiAdminLogout(req, res);
@@ -1790,6 +1791,165 @@ async function apiChatActive(req, res, url) {
   if (!conv) return sendJson(res, 404, { error: 'conversation_not_found' });
   const info = activeGenerationInfo(conversationId);
   return sendJson(res, 200, info || { active: false });
+}
+
+const ENGLISH_GRADING_SYSTEM_PROMPT = `你是严格、专业、熟悉考研英语一/英语二评分标准的阅卷老师。你的任务是批改学生的翻译或写作作答，并给出可执行的提分建议。
+
+评分原则：
+1. 必须结合题干、题型、满分和学生作答评分，不要脱离题目泛泛评价。
+2. 翻译题重点看：原文信息完整度、关键词/术语准确性、长难句结构理解、中文表达通顺度、漏译/错译/增译。
+3. 小作文重点看：格式与称呼落款、任务点覆盖、语气得体、内容完整、语言准确、字数与篇章连贯。
+4. 大作文重点看：审题和图表/图画描述、中心论点、论证展开、结构衔接、语言准确和表达丰富度。
+5. 评分要严格但不要恶意压分；如果作答严重偏题、空泛或字数明显不足，要明确扣分原因。
+6. 不要编造题目没有提供的信息；若参考答案缺失，可以依据考研评分习惯批改，但要说明这是按通用标准估分。
+
+只输出 JSON，不要 markdown，不要代码块。JSON 结构固定为：
+{
+  "score": 0,
+  "total": 10,
+  "level": "低分 | 中等 | 良好 | 高分",
+  "summary": "一句话总评",
+  "breakdown": [
+    {"name": "内容/要点", "score": 0, "total": 0, "comment": "具体原因"},
+    {"name": "语言表达", "score": 0, "total": 0, "comment": "具体原因"},
+    {"name": "结构/格式", "score": 0, "total": 0, "comment": "具体原因"}
+  ],
+  "issues": ["最多5条主要扣分点"],
+  "suggestions": ["最多5条可直接执行的修改建议"],
+  "polishedAnswer": "在学生原意基础上的示范改写或参考译文",
+  "examTips": ["1-3条同类题考试提醒"]
+}`;
+
+async function apiEnglishGrade(req, res) {
+  const student = requireStudent(req, res);
+  if (!student) return;
+  const body = await readJson(req);
+  const taskType = normalizeEnglishGradeTaskType(body.taskType || body.type);
+  if (!taskType) return sendJson(res, 400, { error: 'invalid_task_type', message: '只能批改翻译、小作文或大作文。' });
+
+  const studentAnswer = cleanText(body.studentAnswer || body.answer || '').slice(0, 8000);
+  if (studentAnswer.length < 8) return sendJson(res, 400, { error: 'empty_answer', message: '请先填写你的作答内容。' });
+
+  const provider = selectOpenAICompatibleProvider(body.providerId);
+  const quotaReservation = reserveQuestionQuota(student, provider, 'english_grade', { chatMode: 'qa' });
+  if (!quotaReservation.ok) return sendQuotaExceeded(res, quotaReservation);
+
+  try {
+    if (!provider || !provider.api_key || !provider.enabled) {
+      throw new Error('当前没有可用模型，请联系管理员。');
+    }
+    const total = normalizeEnglishGradeTotal(body.total, taskType);
+    const prompt = buildEnglishGradePrompt({
+      taskType,
+      exam: body.exam,
+      year: body.year,
+      title: body.title,
+      prompt: body.prompt,
+      sourceText: body.sourceText,
+      referenceAnswer: body.referenceAnswer,
+      studentAnswer,
+      total
+    });
+    const raw = await callOpenAITextOnce(provider, ENGLISH_GRADING_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], 1800);
+    const parsed = parseJsonLoose(raw);
+    if (!parsed) throw new Error('AI 评分结果格式异常，请重试。');
+    const report = normalizeEnglishGradeReport(parsed, { total, raw });
+    const quota = consumeQuestionQuota(quotaReservation.reservationId, {}) || getStudentQuota(student);
+    return sendJson(res, 200, { ok: true, report, quota, provider: publicProvider(provider) });
+  } catch (err) {
+    releaseQuestionQuota(quotaReservation.reservationId);
+    console.error('[english-grade-error]', err);
+    const publicMessage = err.message === '当前没有可用模型，请联系管理员。' || String(err.message || '').includes('上游模型连接超时')
+      ? err.message
+      : 'AI 评分失败，请稍后重试或切换到 chat 里提问。';
+    return sendJson(res, 500, { error: 'english_grade_failed', message: publicMessage, quota: getStudentQuota(student) });
+  }
+}
+
+function normalizeEnglishGradeTaskType(value) {
+  const raw = String(value || '').toLowerCase();
+  if (raw.includes('translation') || raw.includes('translate') || raw.includes('翻译')) return 'translation';
+  if (raw.includes('part_a') || raw.includes('part a') || raw.includes('application') || raw.includes('小作文')) return 'writing_part_a';
+  if (raw.includes('part_b') || raw.includes('part b') || raw.includes('essay') || raw.includes('大作文')) return 'writing_part_b';
+  return '';
+}
+
+function normalizeEnglishGradeTotal(value, taskType) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return Math.min(30, Math.max(1, n));
+  if (taskType === 'writing_part_a') return 10;
+  if (taskType === 'writing_part_b') return 20;
+  return 15;
+}
+
+function englishGradeTaskLabel(taskType) {
+  return {
+    translation: '翻译',
+    writing_part_a: '小作文',
+    writing_part_b: '大作文'
+  }[taskType] || '英语主观题';
+}
+
+function buildEnglishGradePrompt(input) {
+  const lines = [
+    `【题型】${englishGradeTaskLabel(input.taskType)}`,
+    `【考试】${cleanText(input.year || '')} ${cleanText(input.exam || '')}`.trim(),
+    `【标题】${cleanText(input.title || '')}`,
+    `【满分】${input.total}`,
+    `【题干/要求】\n${cleanText(input.prompt || '').slice(0, 4000) || '（未提供）'}`,
+    `【原文/待翻译文本】\n${cleanText(input.sourceText || '').slice(0, 5000) || '（未提供）'}`,
+    `【参考答案/参考译文】\n${cleanText(input.referenceAnswer || '').slice(0, 5000) || '（未提供）'}`,
+    `【学生作答】\n${cleanText(input.studentAnswer || '').slice(0, 8000)}`
+  ];
+  return lines.join('\n\n');
+}
+
+function normalizeEnglishGradeReport(parsed, { total, raw }) {
+  const report = parsed && typeof parsed === 'object' ? parsed : {};
+  const parsedTotal = Number(report.total);
+  const safeTotal = Number.isFinite(parsedTotal) && parsedTotal > 0
+    ? Math.min(30, Math.max(1, parsedTotal))
+    : total;
+  const score = clampScore(report.score, safeTotal);
+  const breakdown = Array.isArray(report.breakdown) ? report.breakdown.slice(0, 5).map((item) => ({
+    name: cleanText(item?.name || '评分项').slice(0, 20),
+    score: clampScore(item?.score, Number(item?.total || 0) || safeTotal),
+    total: Number(item?.total || 0) || 0,
+    comment: cleanText(item?.comment || '').slice(0, 180)
+  })) : [];
+  return {
+    score,
+    total: safeTotal,
+    level: cleanText(report.level || englishGradeLevel(score, safeTotal)).slice(0, 12),
+    summary: cleanText(report.summary || '已完成评分，请参考下方扣分点修改。').slice(0, 220),
+    breakdown,
+    issues: cleanStringArray(report.issues, 5, 160),
+    suggestions: cleanStringArray(report.suggestions, 5, 180),
+    polishedAnswer: cleanText(report.polishedAnswer || report.polished_answer || raw || '').slice(0, 4000),
+    examTips: cleanStringArray(report.examTips || report.exam_tips, 3, 180)
+  };
+}
+
+function clampScore(value, total) {
+  const n = Number(value);
+  const cap = Number(total) > 0 ? Number(total) : 100;
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(cap, Math.round(n * 10) / 10));
+}
+
+function englishGradeLevel(score, total) {
+  const ratio = total > 0 ? score / total : 0;
+  if (ratio >= 0.85) return '高分';
+  if (ratio >= 0.7) return '良好';
+  if (ratio >= 0.5) return '中等';
+  return '低分';
+}
+
+function cleanStringArray(value, limit, maxLen) {
+  return (Array.isArray(value) ? value : [])
+    .map((item) => cleanText(item || '').slice(0, maxLen))
+    .filter(Boolean)
+    .slice(0, limit);
 }
 
 async function apiAdminLogin(req, res) {
@@ -5427,6 +5587,15 @@ function selectProvider(requestedId) {
     if (row) return row;
   }
   return db.prepare('SELECT * FROM providers WHERE enabled = 1 ORDER BY is_default DESC, id ASC LIMIT 1').get();
+}
+
+function selectOpenAICompatibleProvider(requestedId) {
+  const id = Number(requestedId || 0);
+  if (id) {
+    const row = db.prepare("SELECT * FROM providers WHERE id = ? AND type = 'openai-compatible'").get(id);
+    if (row) return row;
+  }
+  return db.prepare("SELECT * FROM providers WHERE enabled = 1 AND type = 'openai-compatible' ORDER BY is_default DESC, id ASC LIMIT 1").get();
 }
 
 function publicStudent(student) {
