@@ -129,7 +129,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     shuttingDown = true;
     server.close(() => {});
     const deadline = Date.now() + Number(process.env.GRACEFUL_SHUTDOWN_MS || 180000);
-    while (openResponses.size && Date.now() < deadline) {
+    while ((openResponses.size || activeGenerations.size) && Date.now() < deadline) {
       await delay(250);
     }
     for (const res of openResponses) {
@@ -1273,8 +1273,7 @@ async function apiChat(req, res) {
     }
     } catch (err) {
       if (isAbortError(err) || generation.signal.aborted) {
-        // 主动停止 / 客户端断开：保留已生成的部分，照常落库 + 扣额度
-        answer = res._genAnswer || answer || '';
+        if (generation.shouldPersistAbort()) answer = res._genAnswer || answer || '';
       } else {
         console.error('[chat-upstream-error]', err);
         const publicMessage = err.message === '当前没有可用模型，请联系管理员。' || String(err.message || '').includes('上游模型连接超时')
@@ -1285,6 +1284,7 @@ async function apiChat(req, res) {
     } finally {
       generation.cleanup();
     }
+    if (generation.abortReason()) answer = '';
 
     if (answer) {
       assistantId = randomId('msg');
@@ -1406,8 +1406,7 @@ async function apiEditChat(req, res) {
     }
     } catch (err) {
       if (isAbortError(err) || generation.signal.aborted) {
-        // 主动停止 / 客户端断开：保留已生成的部分，照常落库 + 扣额度
-        answer = res._genAnswer || answer || '';
+        if (generation.shouldPersistAbort()) answer = res._genAnswer || answer || '';
       } else {
         console.error('[chat-edit-upstream-error]', err);
         const publicMessage = err.message === '当前没有可用模型，请联系管理员。' || String(err.message || '').includes('上游模型连接超时')
@@ -1418,6 +1417,7 @@ async function apiEditChat(req, res) {
     } finally {
       generation.cleanup();
     }
+    if (generation.abortReason()) answer = '';
 
     if (answer) {
       assistantId = randomId('msg');
@@ -1557,8 +1557,7 @@ async function apiRetryChat(req, res) {
     }
     } catch (err) {
       if (isAbortError(err) || generation.signal.aborted) {
-        // 主动停止 / 客户端断开：保留已生成的部分，照常落库 + 扣额度
-        answer = res._genAnswer || answer || '';
+        if (generation.shouldPersistAbort()) answer = res._genAnswer || answer || '';
       } else {
         console.error('[chat-retry-upstream-error]', err);
         const publicMessage = err.message === '当前没有可用模型，请联系管理员。' || String(err.message || '').includes('上游模型连接超时')
@@ -1569,6 +1568,7 @@ async function apiRetryChat(req, res) {
     } finally {
       generation.cleanup();
     }
+    if (generation.abortReason()) answer = '';
 
     if (answer) {
       assistantId = randomId('msg');
@@ -1700,8 +1700,7 @@ async function apiContinueChat(req, res) {
     }
     } catch (err) {
       if (isAbortError(err) || generation.signal.aborted) {
-        // 主动停止 / 客户端断开：保留已生成的部分，照常落库 + 扣额度
-        answer = res._genAnswer || answer || '';
+        if (generation.shouldPersistAbort()) answer = res._genAnswer || answer || '';
       } else {
         console.error('[chat-continue-upstream-error]', err);
         const publicMessage = err.message === '当前没有可用模型，请联系管理员。' || String(err.message || '').includes('上游模型连接超时')
@@ -1712,6 +1711,7 @@ async function apiContinueChat(req, res) {
     } finally {
       generation.cleanup();
     }
+    if (generation.abortReason()) answer = '';
 
     if (answer) {
       assistantId = randomId('msg');
@@ -1767,7 +1767,7 @@ async function apiContinueChat(req, res) {
   res.end();
 }
 
-// 主动停止：客户端点「停止」时调用，真正中止服务端生成（已生成部分会被保存 + 计额度）。
+// 主动停止：客户端点「停止」时调用，真正中止服务端生成；不保存部分回答，也不计额度。
 async function apiStopChat(req, res) {
   const student = requireStudent(req, res);
   if (!student) return;
@@ -5742,21 +5742,29 @@ function safeEndSse(res) {
 
 // ===== 服务端续跑生成：与客户端连接解耦 =====
 // 关键修复：旧版把 provider 流的中止绑定到 res 的 'close'，客户端刷新/断网即中止，
-// 已花的 token 被丢弃且不计额度。现在生成只由「主动停止」(/api/chat/stop) 中止，
-// 客户端离开不影响生成；完成后照常落库 + 扣额度。
-const activeGenerations = new Map(); // conversationId -> { controller, res, startedAt }
+// 已花的 token 被丢弃且不计额度。现在生成只由「主动停止」(/api/chat/stop) 中止；
+// 客户端离开不影响生成，完成后照常落库 + 扣额度；主动停止则释放额度。
+const activeGenerations = new Map(); // conversationId -> { controller, res, startedAt, abortReason }
 
 function beginGeneration(conversationId, res) {
   const controller = new AbortController();
   res._genAnswer = '';
   const prev = activeGenerations.get(conversationId);
   if (prev && prev.controller !== controller) {
+    prev.abortReason = 'superseded';
     try { prev.controller.abort(); } catch {}
   }
-  activeGenerations.set(conversationId, { controller, res, startedAt: Date.now() });
+  const generationState = { controller, res, startedAt: Date.now(), abortReason: null };
+  activeGenerations.set(conversationId, generationState);
   return {
     signal: controller.signal,
     controller,
+    abortReason() {
+      return generationState.abortReason;
+    },
+    shouldPersistAbort() {
+      return !generationState.abortReason;
+    },
     cleanup() {
       const cur = activeGenerations.get(conversationId);
       if (cur && cur.controller === controller) activeGenerations.delete(conversationId);
@@ -5767,6 +5775,7 @@ function beginGeneration(conversationId, res) {
 function stopGenerationFor(conversationId) {
   const cur = activeGenerations.get(conversationId);
   if (!cur) return false;
+  cur.abortReason = 'user_stop';
   try { cur.controller.abort(); } catch {}
   return true;
 }

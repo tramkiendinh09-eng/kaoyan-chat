@@ -67,6 +67,8 @@ const state = {
   sending: false,
   autoScroll: true,
   abortController: null,
+  stopRequested: false,
+  pendingResumeSync: null,
   attachmentDrafts: new Map(),
   pendingDeletes: new Map(),
   activeUndoDeleteId: null,
@@ -765,8 +767,26 @@ function bindChatEvents() {
   window.addEventListener('resize', handleRightRailResize);
   window.removeEventListener('beforeunload', saveCurrentDraft);
   window.addEventListener('beforeunload', saveCurrentDraft);
+  document.removeEventListener('visibilitychange', handleChatVisibilityChange);
+  document.addEventListener('visibilitychange', handleChatVisibilityChange);
+  window.removeEventListener('pageshow', handleChatPageShow);
+  window.addEventListener('pageshow', handleChatPageShow);
+  window.removeEventListener('online', handleChatReconnect);
+  window.addEventListener('online', handleChatReconnect);
   renderUndoToast();
   renderSelectionToolbar();
+}
+
+function handleChatVisibilityChange() {
+  if (!document.hidden) maybeResumeGeneration();
+}
+
+function handleChatPageShow() {
+  maybeResumeGeneration();
+}
+
+function handleChatReconnect() {
+  scheduleResumeSync();
 }
 
 function toggleSidebar() {
@@ -1065,8 +1085,29 @@ async function maybeResumeGeneration() {
   } catch {
     return;
   }
-  if (!info || !info.active || state.currentConversationId !== conversationId) return;
+  if (!info || state.currentConversationId !== conversationId) return;
+  if (!info.active) {
+    if (state.pendingResumeSync === conversationId && !state.sending) {
+      state.pendingResumeSync = null;
+      await loadConversations();
+      if (state.currentConversationId === conversationId) {
+        await refreshCurrentConversationMessages({ skipResume: true });
+        await refreshStudyMemoryAfterAnswer();
+      }
+    }
+    return;
+  }
   pollActiveGeneration(conversationId, info.partial || '');
+}
+
+function scheduleResumeSync(conversationId = state.currentConversationId) {
+  if (!conversationId) return;
+  state.pendingResumeSync = conversationId;
+  for (const delayMs of [600, 2500, 6500]) {
+    setTimeout(() => {
+      if (state.currentConversationId === conversationId) maybeResumeGeneration();
+    }, delayMs);
+  }
 }
 
 function ensureResumeBubble() {
@@ -3160,12 +3201,13 @@ async function sendMessage() {
     if (target) {
       target.classList.remove('streaming');
       const fallback = stopped
-        ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
+        ? streamAbortMessage(assistantRaw)
         : `发送失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
-      enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()), allowLocalRetry: true });
+      enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()), allowLocalRetry: !stopped || state.stopRequested });
     }
-    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? '已停止生成' : '请求结束');
+    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? streamAbortThinkText() : '请求结束');
+    if (stopped && !state.stopRequested) scheduleResumeSync();
   } finally {
     clearInterval(thinkTimer);
     finishSending();
@@ -3315,12 +3357,13 @@ async function retryMessage(messageId) {
     if (target) {
       target.classList.remove('streaming');
       const fallback = stopped
-        ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
+        ? streamAbortMessage(assistantRaw)
         : `重新生成失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
-      enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()), allowLocalRetry: true });
+      enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()), allowLocalRetry: !stopped || state.stopRequested });
     }
-    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? '已停止生成' : '请求结束');
+    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? streamAbortThinkText() : '请求结束');
+    if (stopped && !state.stopRequested) scheduleResumeSync();
   } finally {
     clearInterval(thinkTimer);
     finishSending();
@@ -3460,12 +3503,13 @@ async function continueMessage(messageId) {
     if (target) {
       target.classList.remove('streaming');
       const fallback = stopped
-        ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
+        ? streamAbortMessage(assistantRaw)
         : `继续回答失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
       enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()) });
     }
-    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? '已停止生成' : '请求结束');
+    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? streamAbortThinkText() : '请求结束');
+    if (stopped && !state.stopRequested) scheduleResumeSync();
   } finally {
     clearInterval(thinkTimer);
     finishSending();
@@ -3658,12 +3702,13 @@ async function editAndResendMessage(messageId, text, article) {
     if (target) {
       target.classList.remove('streaming');
       const fallback = stopped
-        ? `${assistantRaw}${assistantRaw.trim() ? '\n\n' : ''}[已停止生成]`
+        ? streamAbortMessage(assistantRaw)
         : `修改并重问失败：${streamFailureMessage(err)}`;
       await flushStreamingRender(target, fallback);
       enableAssistantActions(assistantId, { exportEnabled: Boolean((assistantRaw || fallback).trim()) });
     }
-    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? '已停止生成' : '请求结束');
+    finishThinkLine(thinkEl, thinkStartedAt, true, stopped ? streamAbortThinkText() : '请求结束');
+    if (stopped && !state.stopRequested) scheduleResumeSync();
     await refreshCurrentConversationMessages();
   } finally {
     clearInterval(thinkTimer);
@@ -4630,6 +4675,7 @@ async function copyCurrentConversationLinkFromCommand() {
 
 function startSending(statusText) {
   state.sending = true;
+  state.stopRequested = false;
   state.abortController = new AbortController();
   updateTopbarActions();
     const sendButton = el('#sendBtn');
@@ -4656,10 +4702,12 @@ function finishSending() {
   }
   const status = el('#sendStatus');
   if (status) status.textContent = '';
+  state.stopRequested = false;
 }
 
 function stopGeneration() {
   if (!state.abortController || state.abortController.signal.aborted) return;
+  state.stopRequested = true;
   // 服务端生成已与连接解耦：必须显式通知服务端中止，否则仅断开本地连接，后台会继续跑。
   if (state.currentConversationId) {
     fetch(`${API}/chat/stop`, {
@@ -4674,6 +4722,15 @@ function stopGeneration() {
   if (stopButton) stopButton.disabled = true;
   const status = el('#sendStatus');
   if (status) status.textContent = '正在停止...';
+}
+
+function streamAbortMessage(partial = '') {
+  if (state.stopRequested) return `${partial}${partial.trim() ? '\n\n' : ''}[已停止生成，未扣额度]`;
+  return `${partial}${partial.trim() ? '\n\n' : ''}[页面连接已断开，后台仍在继续生成。稍等片刻会自动同步；也可以刷新当前会话查看完整回答。]`;
+}
+
+function streamAbortThinkText() {
+  return state.stopRequested ? '已停止生成' : '后台继续生成';
 }
 
 async function branchFromMessage(messageId, button) {
